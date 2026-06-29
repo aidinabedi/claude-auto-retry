@@ -1,0 +1,35 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.5.0] - 2026-06-30
+
+This release rolls up everything merged since `0.2.2`, including the API
+overload backoff engine and interactive `/rate-limit-options` menu navigation.
+
+### Added
+- Detect sustained API overload (`529`/`500`/`503`) and retry with exponential
+  backoff, including an event-driven (`StopFailure`) mode (#20, hardened).
+- Interactive navigation of the `/rate-limit-options` menu, driving it to
+  "Stop and wait" across any menu layout (#19, #26).
+- Enable mouse scroll and vi copy-mode in tmux sessions created by the tool (#25).
+
+### Fixed
+- Stop the usage-retry path from spamming an already-resumed session: a lingering
+  limit banner in scrollback no longer re-injects `Continue…` every poll. Detection
+  is now anchored to the live tail, and an `isWorking` gate stops the moment Claude
+  resumes (#29).
+- Require Claude to be in the foreground before driving the
+  `/rate-limit-options` menu, preventing keystrokes from leaking into the wrong
+  pane (#28).
+- Reliable retry submission plus session/weekly rate-limit detection (#7, #15, #22).
+- Correct an off-by-a-day wait when parsing reset times in offset timezones (#6, #23).
+- Unalias `claude` before defining the wrapper, fixing a zsh/bash `source` error (#10, #24).
+- Skip send-keys correctly when the foreground process is the shell, not Claude (#1).
+
+## [0.2.2] - 2026-03-31
+
+- Last published baseline release.
