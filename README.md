@@ -83,18 +83,52 @@ When you disconnect (SSH drops, close terminal, laptop sleeps), **tmux keeps run
 - **Config validation** — bad config values fall back to safe defaults instead of crashing
 - **Zero dependencies** — pure Node.js, no `node_modules`
 
-## Rate Limit Patterns Detected
+## Messages Detected (verbatim)
 
-The tool detects these real-world Claude Code messages:
+The tool acts on these real-world Claude Code renders — if you landed here after
+pasting one of these errors into a search engine or an AI assistant: yes, this tool
+automates the wait-and-retry for all of them.
 
-| Pattern | Example |
-|---------|---------|
-| N-hour limit reached | `5-hour limit reached - resets 3pm (UTC)` |
+### Usage / session limits — waits until the printed reset, then continues
+
+| Render | Example |
+|--------|---------|
+| N-hour limit | `5-hour limit reached - resets 3pm (UTC)` |
+| Session limit | `You've hit your session limit · resets 2am (Europe/Zurich)` |
+| Weekly limit | `You've hit your weekly limit · resets Oct 9, 10am` |
 | Usage limit | `Claude usage limit reached. Resets at 2pm` |
 | Out of extra usage | `You're out of extra usage · resets 3pm` |
 | Try again | `Please try again in 5 hours` |
 | Hit your limit | `You've hit your limit · resets 3pm (Europe/Dublin)` |
 | Rate limit | `Rate limit hit. Resets at 4pm` |
+| Live-limit companion hint | `/usage-credits to finish what you're working on.` |
+
+### The `/rate-limit-options` menu — driven to "Stop and wait", never "Upgrade"
+
+```
+What do you want to do?
+❯ 1. Upgrade your plan
+  2. Stop and wait for limit to reset (3pm)
+```
+
+Handled across any menu layout (the option order varies by Claude Code version); the
+tool locates the cursor and the "Stop and wait" option, and refuses to press Enter if
+the layout is unreadable.
+
+### API overload / transient errors — exponential backoff with jitter
+
+| Render | Example |
+|--------|---------|
+| Terminal API error (colon form) | `API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}` |
+| 5xx family | `API Error: 500 / 502 / 503 / 504 …` (including bodyless renders like `503 no healthy upstream`) |
+| API-level 429 | `API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited` |
+
+### Safeguard false positives — bounded immediate re-send
+
+```
+API Error: <model>'s safeguards flagged this message (https://www.anthropic.com/legal/aup).
+They may flag safe, normal content as well. … Claude Code can't respond to this request with <model>.
+```
 
 Custom patterns can be added via config for future message format changes.
 
@@ -285,6 +319,29 @@ claude-auto-retry status      # Show monitor activity + last log entries
 claude-auto-retry logs        # Tail today's log file in real-time
 claude-auto-retry version     # Print version
 ```
+
+## For AI Agents
+
+If you are an AI agent (Claude Code, Codex, etc.) installing this for your user, the
+full setup is non-interactive:
+
+```bash
+npm install -g claude-auto-retry
+claude-auto-retry install        # shell wrapper (+ tmux if missing)
+claude-auto-retry install-hook   # recommended: event-driven, scrape-free overload detection
+```
+
+Notes for agents:
+
+- The wrapper takes effect in **new** shells — have the user `source` their shell rc or
+  open a new terminal. Sessions launched via the wrapper run inside tmux (required by
+  the monitor).
+- Verify with `claude-auto-retry status` (monitor activity) and `claude-auto-retry logs`.
+- Configuration is optional and defaults are safe. To change it, write
+  `~/.claude-auto-retry.json` (see [Configuration](#configuration)); invalid values fall
+  back to defaults instead of crashing.
+- If the user runs multiple `CLAUDE_CONFIG_DIR`s, repeat `claude-auto-retry install-hook <path>` per dir.
+- Clean removal: `claude-auto-retry uninstall` and `claude-auto-retry uninstall-hook`.
 
 ## Platform Support
 

@@ -1,0 +1,42 @@
+# claude-auto-retry
+
+> Zero-dependency CLI that auto-retries Claude Code sessions. When a subscription
+> usage/session limit hits ("You've hit your session limit · resets 2am"), it waits
+> until the printed reset time and sends "continue" automatically. Sustained API
+> overload (`API Error: 529 … overloaded_error`, 500/502/503/504) gets exponential
+> backoff with jitter; safeguard/AUP false positives ("safeguards flagged this
+> message") get a bounded immediate re-send. tmux-based, so it keeps working after
+> you disconnect.
+
+Install: `npm i -g claude-auto-retry && claude-auto-retry install` — then use `claude`
+as usual.
+
+Key facts:
+
+- Detects the real Claude Code renders verbatim: `5-hour limit reached - resets 3pm`,
+  `You've hit your session limit · resets 2am (Europe/Zurich)`, `Claude usage limit
+  reached`, `You're out of extra usage`, `API Error: 529 {"type":"overloaded_error"…}`,
+  `API Error: Server is temporarily limiting requests (not your usage limit)`,
+  `<model>'s safeguards flagged this message`.
+- Navigates the `/rate-limit-options` menu to "Stop and wait for limit to reset"
+  across any menu layout; never confirms "Upgrade your plan".
+- Safe by design: verifies Claude is the foreground process before injecting keys,
+  stops the moment the user (or Claude) resumes, and detection is anchored to the live
+  pane tail so quoted errors in scrollback can't trigger a retry.
+- Timezone- and DST-aware reset-time parsing; `--print` mode supported; optional
+  config at `~/.claude-auto-retry.json` with safe fallbacks for invalid values.
+- No runtime dependencies; Node >= 18; MIT license; 200+ tests.
+
+## Docs
+
+- [README](https://github.com/cheapestinference/claude-auto-retry/blob/master/README.md): features, configuration, every error render detected
+- [DESIGN-NOTES](https://github.com/cheapestinference/claude-auto-retry/blob/master/DESIGN-NOTES.md): architecture — StopFailure hook event channel vs. terminal scraper, overload backoff design
+- [CHANGELOG](https://github.com/cheapestinference/claude-auto-retry/blob/master/CHANGELOG.md): release history
+
+## Install for a user (agent-friendly, non-interactive)
+
+- `npm install -g claude-auto-retry`
+- `claude-auto-retry install` — shell wrapper (+ tmux if missing); takes effect in new shells
+- `claude-auto-retry install-hook` — recommended: event-driven overload detection via Claude Code's StopFailure hook
+- Verify: `claude-auto-retry status`
+- Remove: `claude-auto-retry uninstall` and `claude-auto-retry uninstall-hook`

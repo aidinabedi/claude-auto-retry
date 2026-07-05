@@ -18,5 +18,5 @@
     "type": "git",
     "url": "https://github.com/cheapestinference/claude-auto-retry"
   },
-  "files": ["bin/", "src/", "LICENSE", "README.md", "CHANGELOG.md"]
+  "files": ["bin/", "src/", "LICENSE", "README.md", "CHANGELOG.md", "llms.txt"]
 }
