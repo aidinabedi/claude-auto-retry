@@ -1,4 +1,4 @@
-import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, isWorking } from './patterns.js';
+import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, detectSafeguard, safeguardMatch, isWorking } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
 import { capturePane, sendKeys, sendKey, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
@@ -21,6 +21,8 @@ export function createMonitorState() {
     // seen (proves the hook is live → stop trusting the scraper). viaEvent marks the
     // current backoff window as event-triggered (edge: one send per failure).
     eventMode: false, viaEvent: false,
+    // Safeguard/AUP false-positive retry sub-state (bounded, seconds-scale).
+    safeguardAttempts: 0, safeguardWaitUntil: 0,
   };
 }
 
@@ -47,6 +49,12 @@ function resetOverload(state) {
   state.overloadTotalWaitMs = 0;
   state.overloadWaitUntil = 0;
   state.viaEvent = false;
+}
+
+function resetSafeguard(state) {
+  state.safeguardAttempts = 0;
+  state.safeguardWaitUntil = 0;
+  state._safeguardGaveUp = false;
 }
 
 // Foreground safety: is claude/node the foreground process (safe to send-keys), or did
@@ -283,6 +291,56 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     return 'overload-retried';
   }
 
+  if (state.status === 'safeguard') {
+    if (Date.now() < state.safeguardWaitUntil) return 'safeguard-waiting';
+    if (!isAlive()) return 'exit';
+    const safeguard = config.safeguard;
+
+    // A usage limit or Claude resuming takes precedence / means recovery.
+    if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
+      resetSafeguard(state); return enterUsageWait(state, stripped, config);
+    }
+    // In flight (our retry, or the user typing continued things). Defer WITHOUT consuming
+    // or resetting — a tick landing mid-retry must not zero the counter, or a sticky flag
+    // re-enters with a fresh budget and the maxRetries bound never trips (verified: it
+    // retried indefinitely). Mirrors the overload branch. Recovery is decided at the next
+    // idle tick: flag gone -> cleared; flag still there -> the count stands.
+    if (isWorking(stripped)) {
+      state.safeguardWaitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 2);
+      return 'safeguard-working';
+    }
+
+    // Flag gone → recovered.
+    if (!detectSafeguard(stripped, safeguard.patterns)) {
+      resetSafeguard(state); state.status = 'monitoring'; return 'safeguard-cleared';
+    }
+
+    // Sticky flag: give up loudly rather than loop. Long cooldown so we don't re-detect
+    // the stale error every tick.
+    if (state.safeguardAttempts >= safeguard.maxRetries) {
+      state.safeguardWaitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 12);
+      // Give up LOUDLY — once. Subsequent holds are silent or the warn re-logs ~1/min
+      // for as long as the sticky banner sits at the prompt.
+      if (state._safeguardGaveUp) return 'safeguard-holding';
+      state._safeguardGaveUp = true;
+      return 'safeguard-gave-up';
+    }
+
+    // Foreground safety: only send when claude/node is foreground.
+    const fg = await checkForeground(tmuxAdapter, pane, config);
+    if (!fg.ok) {
+      state._lastForeground = fg.fg;
+      state.safeguardWaitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 6);
+      return 'skipped-not-claude';
+    }
+
+    // Increment + schedule BEFORE send so a send failure still consumes the slot.
+    state.safeguardAttempts++;
+    state.safeguardWaitUntil = Date.now() + (safeguard.retryDelaySeconds * 1000);
+    await tmuxAdapter.sendKeys(pane, safeguard.retryMessage);
+    return 'safeguard-retried';
+  }
+
   // --- monitoring ---
   // Usage-limit (hours-scale reset) takes precedence over overload (seconds-scale).
   if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
@@ -326,6 +384,20 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     if (match) {
       state._overloadMatch = match;  // surfaced in the 'overload-detected' log line
       return enterOverload(state, overload, rand);
+    }
+  }
+
+  // Safeguard/AUP false-positive: enter a bounded, seconds-scale retry loop. Independent
+  // of the overload path (different render, different recovery). Only when Claude is idle.
+  const safeguard = config.safeguard;
+  if (safeguard && safeguard.enabled && !isWorking(stripped)) {
+    const match = safeguardMatch(stripped, safeguard.patterns);
+    if (match) {
+      resetSafeguard(state);
+      state.status = 'safeguard';
+      state.safeguardWaitUntil = Date.now() + (safeguard.retryDelaySeconds * 1000);
+      state._safeguardMatch = match;
+      return 'safeguard-detected';
     }
   }
 
@@ -389,6 +461,13 @@ export async function startMonitor(pane, pid) {
       if (result === 'overload-relaunched') await logger.warn(`Claude exited to shell on overload; relaunched via "${config.overload.relaunchCommand}" (relaunchOnExit on, attempt ${state.overloadAttempts}).`);
       if (result === 'overload-exited-to-shell') await logger.warn(`Overload error left claude exited to the shell ("${state._lastForeground}"). Not auto-relaunching (relaunchOnExit off). Re-run "claude --continue" to resume, or set overload.relaunchOnExit:true.`);
       if (result === 'overload-gave-up') await logger.warn(`Overload backoff cap reached (maxTotalWaitMinutes=${config.overload.maxTotalWaitMinutes}). Giving up — endpoint may be genuinely down (check status.claude.com). Will not retry until the error clears.`);
+      if (result === 'safeguard-detected') {
+        const m = state._safeguardMatch;
+        await logger.warn(`Safeguard/AUP flag detected${m ? ` [matched /${m.pattern}/ in: "${m.line}"]` : ''} — often a false positive. Will retry up to ${config.safeguard.maxRetries}x every ${config.safeguard.retryDelaySeconds}s.`);
+      }
+      if (result === 'safeguard-retried') await logger.info(`Safeguard retry sent (attempt ${state.safeguardAttempts}/${config.safeguard.maxRetries}).`);
+      if (result === 'safeguard-cleared') await logger.info('Safeguard flag cleared. Resuming normal monitoring.');
+      if (result === 'safeguard-gave-up') await logger.warn(`Safeguard flag persisted after ${config.safeguard.maxRetries} retries. Giving up — the flag is likely sticky for this content/model; try /model to switch models or rephrase. Will not retry until it clears.`);
     } catch (err) {
       consecutiveErrors++;
       await logger.error(`Monitor tick error: ${err.message}`).catch(() => {});

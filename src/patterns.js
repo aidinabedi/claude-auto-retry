@@ -189,6 +189,41 @@ export function detectOverload(text, patterns = []) {
   return overloadMatch(text, patterns) !== null;
 }
 
+// --- Safeguard / AUP false-positive detection ---
+// A distinct failure mode from usage limits and 5xx overloads: the model's safeguards
+// flag the message (often a false positive — the error itself says it "may flag safe,
+// normal content"). It renders like:
+//   ● API Error: Fable 5's safeguards flagged this message (…/legal/aup). … Claude Code
+//     can't respond to this request with Fable 5.
+//     Double press esc to edit your last message, or try a different model with /model.
+// Because the flag is semi-random, an immediate re-send frequently clears it — but it
+// must be capped so a *sticky* flag doesn't loop forever. Tail-anchored like the others.
+// Anchor: a REAL flag always renders as an `API Error:` line. Requiring it nearby (same
+// wrap-tolerant window isRateLimited uses for limit/resets pairing) keeps the phrases
+// from firing on ordinary conversation — Claude quoting the AUP link or discussing
+// safeguard errors at an idle prompt must not trigger a retry. (DEFAULT_OVERLOAD learned
+// this the hard way; see its comment about bare status numbers.)
+const SAFEGUARD_ANCHOR = [/\bAPI Error\b/i];
+
+export function safeguardMatch(text, patterns = []) {
+  if (!patterns || patterns.length === 0) return null;
+  const lines = tail(text);
+  if (!lines.join('').trim()) return null;
+  const regexes = toRegexes(patterns);
+  for (let i = 0; i < lines.length; i++) {
+    for (const r of regexes) {
+      if (r.test(lines[i]) && hasNearbyMatch(lines, i, SAFEGUARD_ANCHOR)) {
+        return { pattern: r.source, line: lines[i].trim().slice(0, 200) };
+      }
+    }
+  }
+  return null;
+}
+
+export function detectSafeguard(text, patterns = []) {
+  return safeguardMatch(text, patterns) !== null;
+}
+
 export function isWorking(text) {
   const lines = tail(text);
   return lines.some(line => WORKING_PATTERNS.some(p => p.test(line)));

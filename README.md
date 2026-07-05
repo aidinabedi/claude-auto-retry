@@ -77,6 +77,7 @@ When you disconnect (SSH drops, close terminal, laptop sleeps), **tmux keeps run
 - **DST-safe** — iterative offset correction handles daylight saving transitions
 - **Safe send-keys** — verifies Claude is still the foreground process before injecting text
 - **Overload backoff** — detects sustained API overload (`429/500/502/503/504/529`) and retries on a configurable exponential backoff with jitter and a cumulative-wait cap, distinct from the usage-reset path ([details](#overload-backoff))
+- **Safeguard retry** — auto-continues past an AUP-safeguard false-positive (often transient), capped at a few tries so a sticky flag can't loop ([details](#safeguard-retry))
 - **`--print` mode support** — buffers output, retries cleanly for piped/scripted usage
 - **Configurable** — retry count, wait margin, custom patterns, retry message
 - **Config validation** — bad config values fall back to safe defaults instead of crashing
@@ -227,6 +228,53 @@ the foreground check (it never types into bash), and the tool logs
 default** — blindly typing `claude --continue` into a shell the user may be using
 is worse than surfacing the stall. Set `relaunchOnExit: true` (and adjust
 `relaunchCommand`) only if you actually observe shell-exits on overload.
+
+## Safeguard retry
+
+A third failure mode, separate from usage limits and 5xx overloads: the model's
+**safeguards flag your message** and Claude Code can't respond. It renders like:
+
+```
+● API Error: Fable 5's safeguards flagged this message (…/legal/aup). They may flag
+  safe, normal content as well. … Claude Code can't respond to this request with Fable 5.
+  Double press esc to edit your last message, or try a different model with /model.
+```
+
+These flags are **often false positives** (the message says so) and semi-random, so an
+immediate re-send frequently clears them. When the tool sees this render at an idle
+prompt, it sends a short retry message (`continue` by default), waits a few seconds, and
+repeats — but only up to `maxRetries` times, then **gives up loudly** (logged) rather
+than looping. A sticky flag means the content/model combination is genuinely blocked;
+switch models with `/model` or rephrase.
+
+Detection is tail-anchored (last 12 pane lines) like the overload path, and a match
+additionally requires the `API Error` render line nearby — so the phrases appearing in
+scrollback or in a conversation *about* safeguards won't trigger it.
+
+Configured under a `safeguard` block (defaults shown):
+
+```json
+{
+  "safeguard": {
+    "enabled": true,
+    "patterns": ["safeguards flagged this message", "can't respond to this request with", "legal/aup"],
+    "maxRetries": 3,
+    "retryDelaySeconds": 8,
+    "retryMessage": "continue"
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `true` | Turn the safeguard-retry path on/off |
+| `patterns` | (see above) | Case-insensitive regexes marking the safeguard render (matched in the pane tail, near an `API Error` line) |
+| `maxRetries` | `3` | Re-send attempts before giving up — kept small; retrying a sticky flag won't help |
+| `retryDelaySeconds` | `8` | Wait between re-sends |
+| `retryMessage` | `"continue"` | Message sent to nudge past the flag |
+
+Usage limits always take precedence; the safeguard path only acts when Claude is idle
+(no `esc to interrupt` footer) and the foreground process is `claude`/`node`.
 
 ## CLI Commands
 

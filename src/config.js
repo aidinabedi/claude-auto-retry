@@ -44,6 +44,26 @@ export const DEFAULT_OVERLOAD = {
   relaunchCommand: 'claude --continue',
 };
 
+// Safeguard / AUP false-positive retry. Distinct from usage limits (hours) and overload
+// (5xx, exponential): the model's safeguards flag a message — often a false positive, so
+// an immediate re-send usually clears it. Bounded by maxRetries so a *sticky* flag can't
+// loop forever. See README "Safeguard retry".
+export const DEFAULT_SAFEGUARD = {
+  enabled: true,
+  // Case-insensitive regexes matched against the pane tail; a match only counts with an
+  // `API Error` line nearby (see safeguardMatch) so quoting/discussing these phrases in
+  // conversation can't trigger a retry. Match the stable phrases of the render, not the
+  // model name (which varies).
+  patterns: [
+    "safeguards flagged this message",
+    "can't respond to this request with",   // "Claude Code can't respond to this request with <model>"
+    "legal/aup",                             // the AUP link Anthropic includes
+  ],
+  maxRetries: 3,          // small — if it keeps flagging, retrying won't help
+  retryDelaySeconds: 8,   // brief pause between re-sends (semi-random flag; quick retry helps)
+  retryMessage: 'continue',
+};
+
 export const DEFAULT_CONFIG = {
   maxRetries: 5,
   pollIntervalSeconds: 5,
@@ -52,6 +72,7 @@ export const DEFAULT_CONFIG = {
   retryMessage: 'Continue where you left off. The previous attempt was rate limited.',
   customPatterns: [],
   overload: DEFAULT_OVERLOAD,
+  safeguard: DEFAULT_SAFEGUARD,
 };
 
 const CONFIG_PATH = join(homedir(), '.claude-auto-retry.json');
@@ -102,6 +123,24 @@ function validateOverload(raw) {
   return o;
 }
 
+function validateSafeguard(raw) {
+  const s = { ...DEFAULT_SAFEGUARD, ...(raw && typeof raw === 'object' ? raw : {}) };
+  s.enabled = typeof s.enabled === 'boolean' ? s.enabled : DEFAULT_SAFEGUARD.enabled;
+  const pats = Array.isArray(s.patterns)
+    ? s.patterns.filter(p => {
+        if (typeof p !== 'string' || p.length === 0) return false;
+        try { new RegExp(p); return true; } catch { return false; }
+      })
+    : [];
+  s.patterns = pats.length > 0 ? pats : [...DEFAULT_SAFEGUARD.patterns];
+  s.maxRetries = validNumber(s.maxRetries, 1, DEFAULT_SAFEGUARD.maxRetries);
+  s.retryDelaySeconds = validNumber(s.retryDelaySeconds, 1, DEFAULT_SAFEGUARD.retryDelaySeconds);
+  if (typeof s.retryMessage !== 'string' || !s.retryMessage) {
+    s.retryMessage = DEFAULT_SAFEGUARD.retryMessage;
+  }
+  return s;
+}
+
 function validate(cfg) {
   cfg.maxRetries = validNumber(cfg.maxRetries, 1, DEFAULT_CONFIG.maxRetries);
   cfg.pollIntervalSeconds = validNumber(cfg.pollIntervalSeconds, 1, DEFAULT_CONFIG.pollIntervalSeconds);
@@ -124,6 +163,7 @@ function validate(cfg) {
     }
   }
   cfg.overload = validateOverload(cfg.overload);
+  cfg.safeguard = validateSafeguard(cfg.safeguard);
   return cfg;
 }
 
