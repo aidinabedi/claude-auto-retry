@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Safeguard/AUP false-positive auto-retry: when the model's safeguards flag a
+  message ("safeguards flagged this message"), re-send a short retry up to
+  `safeguard.maxRetries` times, then give up loudly once. Detection is anchored
+  to the `API Error` render (mentioning the phrases in conversation can't
+  trigger it), and the retry budget is kept across working ticks so a sticky
+  flag stays bounded (#33).
+
+### Fixed
+- `rate_limit` StopFailure events are no longer routed through the seconds-scale
+  overload path — a session/usage limit is an hours-scale wait owned by the
+  usage path, and the misroute made the two fight (futile `Continue` retries
+  into a session-limited pane). The marker error type is validated at the
+  consumer too, so an outdated installed hook can't reintroduce it (#31).
+
 ## [0.5.1] - 2026-06-30
 
 **Upgrade if you installed `0.5.0` from npm.** The `0.5.0` npm artifact was built
