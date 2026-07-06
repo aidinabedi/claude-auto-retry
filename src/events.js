@@ -13,6 +13,7 @@
 import { mkdir, writeFile, readFile, unlink, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { sanitizeKey } from './pane-key.js';
 
 export const EVENTS_DIR = join(homedir(), '.claude-auto-retry', 'events');
 
@@ -35,8 +36,7 @@ export function isRetryableError(errorType) {
 
 // tmux pane ids look like "%2"; keep the marker filename to a safe charset.
 function fileFor(paneKey, dir) {
-  const safe = String(paneKey).replace(/[^A-Za-z0-9_-]/g, '_');
-  return join(dir, `${safe}.json`);
+  return join(dir, `${sanitizeKey(paneKey)}.json`);
 }
 
 // Hook side: write a marker for the pane. Atomic (tmp + rename) so the daemon never
