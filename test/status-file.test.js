@@ -1,14 +1,20 @@
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { writeStatus, readStatus, clearStatus } from '../src/status-file.js';
+import { writeStatus, readStatus, clearStatus, sweepStaleStatus } from '../src/status-file.js';
 
 describe('per-pane status file', () => {
   let dir;
+  let originalTmux;
   before(async () => { dir = await mkdtemp(join(tmpdir(), 'car-status-')); });
   after(async () => { await rm(dir, { recursive: true, force: true }); });
+  beforeEach(() => { originalTmux = process.env.TMUX; delete process.env.TMUX; });
+  afterEach(() => {
+    if (originalTmux === undefined) delete process.env.TMUX;
+    else process.env.TMUX = originalTmux;
+  });
 
   it('round-trips a pane-keyed status snapshot', async () => {
     await writeStatus('%2', { status: 'monitoring', waitUntil: 0, overloadWaitUntil: 0, attempts: 0, overloadAttempts: 0 }, dir);
@@ -24,10 +30,11 @@ describe('per-pane status file', () => {
     assert.ok(s.updatedAt >= before_, 'updatedAt should be a real current-time stamp, not the caller value');
   });
 
-  it('sanitizes the pane id into the filename', async () => {
+  it('sanitizes the pane id into the filename, prefixed by a socket key', async () => {
     await writeStatus('%7', { status: 'monitoring' }, dir);
     const files = await readdir(dir);
-    assert.ok(files.includes('_7.json'), files.join(','));
+    // No TMUX env in this test (see beforeEach) -> falls back to the 'default' socket key.
+    assert.ok(files.includes('default__7.json'), files.join(','));
   });
 
   it('returns null for an absent pane', async () => {
@@ -35,7 +42,7 @@ describe('per-pane status file', () => {
   });
 
   it('ignores an unparseable status file', async () => {
-    await writeFile(join(dir, '_4.json'), 'not json');
+    await writeFile(join(dir, 'default__4.json'), 'not json');
     assert.equal(await readStatus('%4', dir), null);
   });
 
@@ -59,5 +66,67 @@ describe('per-pane status file', () => {
     const s = await readStatus('%6', dir);
     assert.equal(s.status, 'waiting');
     assert.equal(s.waitUntil, 12345);
+  });
+
+  describe('cross-server pane-id disambiguation', () => {
+    it('keys the same pane id differently under different TMUX socket paths', async () => {
+      process.env.TMUX = '/tmp/tmux-1000/work,111,0';
+      await writeStatus('%2', { status: 'monitoring' }, dir);
+
+      process.env.TMUX = '/tmp/tmux-1000/personal,222,0';
+      await writeStatus('%2', { status: 'waiting', waitUntil: 999 }, dir);
+
+      process.env.TMUX = '/tmp/tmux-1000/work,111,0';
+      const workStatus = await readStatus('%2', dir);
+      assert.equal(workStatus.status, 'monitoring', 'the "work" server\'s pane %2 must not see "personal"\'s write');
+
+      process.env.TMUX = '/tmp/tmux-1000/personal,222,0';
+      const personalStatus = await readStatus('%2', dir);
+      assert.equal(personalStatus.status, 'waiting');
+      assert.equal(personalStatus.waitUntil, 999);
+    });
+
+    it('falls back to a stable "default" socket key when TMUX is unset', async () => {
+      delete process.env.TMUX;
+      await writeStatus('%8', { status: 'monitoring' }, dir);
+      const files = await readdir(dir);
+      assert.ok(files.includes('default__8.json'), files.join(','));
+    });
+  });
+
+  describe('sweepStaleStatus', () => {
+    it('removes files older than maxAgeSeconds and leaves fresh ones', async () => {
+      const sweepDir = await mkdtemp(join(tmpdir(), 'car-status-sweep-'));
+      try {
+        await writeFile(join(sweepDir, 'default__old.json'), JSON.stringify({ status: 'monitoring', updatedAt: Math.floor(Date.now() / 1000) - 1000 }));
+        await writeStatus('%fresh', { status: 'monitoring' }, sweepDir);
+
+        const removed = await sweepStaleStatus(sweepDir, 300);
+        assert.equal(removed, 1);
+
+        const files = await readdir(sweepDir);
+        assert.equal(files.length, 1);
+        assert.ok(files[0].endsWith('__fresh.json'), files.join(','));
+      } finally {
+        await rm(sweepDir, { recursive: true, force: true });
+      }
+    });
+
+    it('removes unparseable leftovers (e.g. an orphaned .tmp file)', async () => {
+      const sweepDir = await mkdtemp(join(tmpdir(), 'car-status-sweep-'));
+      try {
+        await writeFile(join(sweepDir, 'default__orphan.json'), 'not json');
+        const removed = await sweepStaleStatus(sweepDir, 300);
+        assert.equal(removed, 1);
+        assert.deepEqual(await readdir(sweepDir), []);
+      } finally {
+        await rm(sweepDir, { recursive: true, force: true });
+      }
+    });
+
+    it('is a no-op (returns 0) when the status directory does not exist yet', async () => {
+      const missing = join(tmpdir(), 'car-status-does-not-exist-' + Date.now());
+      assert.equal(await sweepStaleStatus(missing, 300), 0);
+    });
   });
 });

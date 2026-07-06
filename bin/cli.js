@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writeStopFailureEvent, isRetryableError } from '../src/events.js';
+import { sweepStaleStatus } from '../src/status-file.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -160,6 +161,10 @@ async function cmdUninstall() {
   const bashrc = join(homedir(), '.bashrc');
   const zshrc = join(homedir(), '.zshrc');
   for (const rc of [bashrc, zshrc]) { await removeWrapper(rc); }
+  // Best-effort GC of tmux-status snapshot files left behind by monitors that died
+  // without cleaning up (SIGKILL, host sleep/crash) — see src/status-file.js. Failure
+  // here must never block the uninstall itself.
+  await sweepStaleStatus().catch(() => {});
   console.log('Shell function removed. Restart your shell to complete.');
 }
 
