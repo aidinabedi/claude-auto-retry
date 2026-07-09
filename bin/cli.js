@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, readdir, unlink } from 'node:fs/promises';
 import { existsSync, watchFile, unwatchFile } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -19,7 +19,7 @@ const HOOK_MARKER = '_stopfailure-hook';
 // a drop-in `claude` replacement. Only these exact first-argument barewords are
 // intercepted (hyphenated hook names and uncommon words, to minimize collisions).
 export const MANAGEMENT_COMMANDS = new Set([
-  'install-hook', 'uninstall-hook', 'status', 'logs', 'version', 'help', HOOK_MARKER,
+  'install-hook', 'uninstall-hook', 'status', 'logs', 'clear-logs', 'version', 'help', HOOK_MARKER,
 ]);
 
 // Split argv into a management command (or null → launch claude) plus its args.
@@ -49,6 +49,24 @@ async function cmdStatus() {
   } catch {
     console.log('No activity today. Log directory:', LOG_DIR);
   }
+}
+
+// Delete all monitor log files. Only `.log` files inside the tool's own log directory
+// are touched — never the directory itself or anything else in it.
+async function cmdClearLogs() {
+  let entries;
+  try {
+    entries = await readdir(LOG_DIR);
+  } catch {
+    console.log(`No logs to clear (${LOG_DIR} does not exist).`);
+    return;
+  }
+  let removed = 0;
+  for (const name of entries) {
+    if (!name.endsWith('.log')) continue;
+    try { await unlink(join(LOG_DIR, name)); removed++; } catch { /* in use or gone */ }
+  }
+  console.log(removed > 0 ? `Removed ${removed} log file(s) from ${LOG_DIR}.` : `No log files in ${LOG_DIR}.`);
 }
 
 // Node-based `tail -f` (portable — no `tail` on Windows). Prints the current contents,
@@ -157,6 +175,7 @@ function cmdHelp() {
   console.log('  claude-auto-retry uninstall-hook [dir]  Remove the StopFailure hook');
   console.log('  claude-auto-retry status             Show recent monitor activity');
   console.log('  claude-auto-retry logs               Follow today\'s log (Ctrl+C to stop)');
+  console.log('  claude-auto-retry clear-logs         Delete all monitor log files');
   console.log('  claude-auto-retry version            Print version');
   console.log('  claude-auto-retry help               Show this help\n');
   console.log('Any other invocation is forwarded to `claude` unchanged.');
@@ -172,6 +191,7 @@ async function main() {
     case HOOK_MARKER: await cmdStopFailureHook(); break;
     case 'status': await cmdStatus(); break;
     case 'logs': await cmdLogs(); break;
+    case 'clear-logs': await cmdClearLogs(); break;
     case 'version': await cmdVersion(); break;
     case 'help': cmdHelp(); break;
     default: {

@@ -115,7 +115,8 @@ describe('calculateWaitMs', () => {
   });
 
   // Regression (#6): reset already passed today → target tomorrow (~22.6h),
-  // not 48h. Symmetric case for the off-by-a-day bug.
+  // not 48h. Symmetric case for the off-by-a-day bug. (80 minutes past — outside
+  // the recent-past grace window below.)
   it('targets tomorrow when reset time already passed today', () => {
     const now = new Date('2026-05-03T15:00:00Z'); // 1:00 AM next day in Melbourne
     const wait = calculateWaitMs(
@@ -123,5 +124,21 @@ describe('calculateWaitMs', () => {
     );
     const hours = wait / 3600_000;
     assert.ok(hours > 22 && hours < 23, `expected ~22.6h, got ${hours.toFixed(2)}h`);
+  });
+
+  // A reset time RECENTLY past means the limit already lifted (stale banner re-read
+  // at wait expiry) — retry after the margin instead of idling ~23h until tomorrow's
+  // occurrence of the same clock time.
+  it('waits only the margin when the reset time recently passed (grace window)', () => {
+    const now = new Date('2026-05-03T15:10:00Z');
+    const wait = calculateWaitMs({ hour: 15, minute: 0, timezone: 'UTC' }, 60, 5, now); // 10 min past
+    assert.equal(wait, 60_000);
+  });
+
+  it('applies the grace window to ambiguous times too', () => {
+    const now = new Date('2026-05-03T15:20:00Z');
+    // "resets 3" (ambiguous): 3am and 3pm both past today; 3pm was 20 minutes ago.
+    const wait = calculateWaitMs({ hour: 3, minute: 0, timezone: 'UTC', ambiguous: true }, 60, 5, now);
+    assert.equal(wait, 60_000);
   });
 });

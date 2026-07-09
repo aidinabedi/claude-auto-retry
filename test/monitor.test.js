@@ -130,14 +130,49 @@ describe('processOneTick', () => {
   //     re-send every poll (up to maxRetries) while the limit banner lingered in
   //     scrollback after a successful resume — observed live as 5 injections into a
   //     working session. The isWorking gate stops the moment Claude resumes. ---
-  it('does NOT re-send once Claude has resumed and is working', async () => {
+  it('does NOT re-send once Claude has resumed and is working (2-tick debounce)', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)\n· Doing… (esc to interrupt)');
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting'; s.attempts = 1;
+    // First expiry tick: evidence noted, but not yet declared (debounce).
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'waiting');
+    assert.equal(s._continuedPending, true);
+    s.waitUntil = Date.now() - 1;
+    // Second consecutive tick with the same evidence: declared.
     assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'user-continued');
     assert.equal(t._sent.length, 0);          // never injects into the working session
     assert.equal(s.status, 'monitoring');
     assert.equal(s.attempts, 0);
+  });
+
+  // --- Regression (field report): a single banner-free capture at wait expiry —
+  //     repaint, overlay, scrolled transcript — must NOT be read as "user continued";
+  //     it silently stopped the monitor from ever sending the retry. ---
+  it('cancels a pending user-continued when the banner reappears (transient hide)', async () => {
+    const t = mockTmux('nothing that looks limited');
+    const s = createMonitorState();
+    s.waitUntil = Date.now() - 1000; s.status = 'waiting';
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'waiting');
+    assert.equal(s._continuedPending, true);
+    // Banner is back on the next capture: the pending verdict is cancelled and the
+    // normal expired-wait handling (retry) proceeds.
+    t.capturePane = async () => '5-hour limit reached - resets 3pm (UTC)';
+    s.waitUntil = Date.now() - 1;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'retried');
+    assert.equal(s._continuedPending, false);
+    assert.equal(t._sent.length, 1);
+  });
+
+  it('does NOT declare user-continued while the rate-limit menu covers the banner', async () => {
+    // Menu without the banner line, and the menu handler in cooldown — the exact
+    // window where the old code misread "banner absent" as a resume.
+    const t = mockTmux(MENU_UPGRADE_FIRST.split('\n').slice(1).join('\n'));
+    const s = createMonitorState();
+    s.waitUntil = Date.now() - 1000; s.status = 'waiting';
+    s._menuCooldownUntil = Date.now() + 60_000;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'waiting');
+    assert.equal(s.status, 'waiting');
+    assert.equal(s._continuedPending, false);      // menu ≠ evidence of resume
   });
 
   // --- Regression: self-referential false positive. A limit banner only quoted in
@@ -194,10 +229,12 @@ describe('processOneTick', () => {
     s.waitUntil = Date.now() - 1000; s.status = 'waiting';
     assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'retried');
   });
-  it('resets counter when rate limit disappears', async () => {
+  it('resets counter when rate limit disappears (after debounce)', async () => {
     const t = mockTmux('Claude is working normally');
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting'; s.attempts = 2;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'waiting');
+    s.waitUntil = Date.now() - 1;
     assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'user-continued');
     assert.equal(s.attempts, 0);
   });
@@ -217,9 +254,57 @@ describe('processOneTick', () => {
     const t = mockTmux('Claude is working normally');
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting'; s.attempts = 10; s._gaveUp = true;
-    // Rate limit cleared → should detect user-continued before max-retries check
+    // Rate limit cleared → should detect user-continued (after debounce) before
+    // the max-retries check.
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'waiting');
+    s.waitUntil = Date.now() - 1;
     assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'user-continued');
     assert.equal(s.attempts, 0);
     assert.equal(s._gaveUp, false);
+  });
+});
+
+describe('processOneTick — manual rescan (F5)', () => {
+  it('re-parses the FULL screen and re-arms the wait (banner above an overlay)', async () => {
+    // Banner sits ABOVE the 12-line tail (menu/overlay junk below) — normal detection
+    // missed it, so the wait fell back. The rescan scans the whole capture.
+    const pane = [
+      'Please try again in 2 hours',
+      ...Array(14).fill('│ menu junk covering the banner │'),
+    ].join('\n');
+    const t = mockTmux(pane);
+    const s = createMonitorState();
+    s.status = 'waiting';
+    s.attempts = 3;
+    s.waitUntil = Date.now() + 5 * 3600_000;   // the 5h fallback the user complained about
+    s._rescanRequested = true;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'rescan-updated');
+    const expected = Date.now() + 2 * 3600_000 + 60_000;   // 2h + margin
+    assert.ok(Math.abs(s.waitUntil - expected) < 5_000, `waitUntil ${s.waitUntil} !~ ${expected}`);
+    assert.equal(s.status, 'waiting');
+    assert.equal(s.attempts, 0);               // manual request refreshes the budget
+    assert.equal(s._rescanRequested, false);   // consumed
+  });
+
+  it('reports rescan-none and leaves state untouched when no reset text is on screen', async () => {
+    const t = mockTmux('just ordinary output, nothing about limits');
+    const s = createMonitorState();
+    s.status = 'waiting';
+    const before = Date.now() + 5 * 3600_000;
+    s.waitUntil = before;
+    s._rescanRequested = true;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'rescan-none');
+    assert.equal(s.waitUntil, before);
+    assert.equal(s.status, 'waiting');
+    assert.equal(s._rescanRequested, false);
+  });
+
+  it('works from plain monitoring too (enters a wait when a banner is found)', async () => {
+    const t = mockTmux(['Please try again in 1 hours', ...Array(14).fill('scrolled content')].join('\n'));
+    const s = createMonitorState();
+    s._rescanRequested = true;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'rescan-updated');
+    assert.equal(s.status, 'waiting');
+    assert.ok(s.waitUntil > Date.now());
   });
 });

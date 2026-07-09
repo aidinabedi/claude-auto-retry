@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Manual rescan hotkey (F5 / Ctrl+F5)**: when an overlay (typically the
+  `/rate-limit-options` menu) rendered over the reset-time banner and the wait fell
+  back to `fallbackWaitHours`, pressing F5 in the session makes the monitor re-parse
+  the entire visible screen, re-arm the wait to the parsed time, and reset the retry
+  budget. The keypress is intercepted (never forwarded to Claude); a terminal bell
+  acknowledges it and the outcome is logged.
+- `claude-auto-retry clear-logs` — delete all monitor log files.
+
+### Fixed
+- False `user-continued` at wait expiry (field report): a single banner-free screen
+  capture — a repaint, an overlay, a scrolled transcript — was read as "the user
+  already continued", silently stopping the monitor from ever sending its retry. The
+  verdict now requires the evidence on two consecutive ticks, and the
+  `/rate-limit-options` menu being on screen is treated as "still limited" rather than
+  as a resume. The log message now says what was actually observed.
+- A parsed reset time recently in the past (≤60 min — a stale banner re-read at wait
+  expiry) no longer re-arms a wait for tomorrow's occurrence of that clock time
+  (~23h idle); the limit has already lifted, so the monitor retries after the
+  configured margin instead.
+
 ## [0.6.0] - 2026-07-09
 
 Cross-platform port — Windows, macOS, and Linux via an in-process PTY, replacing tmux.

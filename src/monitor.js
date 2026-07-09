@@ -103,6 +103,21 @@ export async function processOneTick(state, adapter, pane, config, isAlive, logg
   const stripped = stripAnsi(raw);
   const overload = config.overload;
 
+  // Manual rescan (F5): the user says the screen shows a reset time we missed —
+  // typically the /rate-limit-options menu rendered over the banner at detection time,
+  // so the wait fell back to fallbackWaitHours. Re-parse the FULL capture (not the
+  // 12-line tail — the banner may sit above a menu or overlay) and re-arm the wait.
+  // A manual request also refreshes the retry budget: the user is explicitly asking
+  // the monitor to act again.
+  if (state._rescanRequested) {
+    state._rescanRequested = false;
+    const message = findRateLimitMessage(stripped, config.customPatterns);
+    if (!message) return 'rescan-none';
+    state.attempts = 0;
+    enterUsageWait(state, stripped, config);
+    return 'rescan-updated';
+  }
+
   // Handle the interactive /rate-limit-options menu before any other logic. A bare
   // Enter here confirms the highlighted default, which on some Claude Code versions
   // is "Upgrade your plan". Navigate to "Stop and wait for limit to reset" wherever
@@ -155,9 +170,28 @@ export async function processOneTick(state, adapter, pane, config, isAlive, logg
     // session (and a banner re-printed by another process keeps it "rate-limited" the
     // whole time). isWorking ⇒ the session continued; never inject into it.
     if (!isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES) || isWorking(stripped)) {
+      // The /rate-limit-options menu on screen means the session is still limited —
+      // the menu merely covers the banner in the tail. Not a resume; the menu handler
+      // above will drive it once its cooldown clears.
+      if (isRateLimitOptionsPrompt(stripped, RATE_LIMIT_TAIL_LINES)) {
+        state._continuedPending = false;
+        state.waitUntil = Date.now() + config.pollIntervalSeconds * 1000;
+        return 'waiting';
+      }
+      // Debounce: one banner-free capture is weak evidence — repaints, overlays and
+      // transcript scrolling all transiently hide the banner, and a false
+      // 'user-continued' silently stops the monitor from ever sending the retry
+      // (observed in the field). Require the evidence on two consecutive ticks.
+      if (!state._continuedPending) {
+        state._continuedPending = true;
+        state.waitUntil = Date.now() + config.pollIntervalSeconds * 1000;
+        return 'waiting';
+      }
+      state._continuedPending = false;
       state.status = 'monitoring'; state.attempts = 0; state._gaveUp = false;
       return 'user-continued';
     }
+    state._continuedPending = false;
 
     if (state.attempts >= config.maxRetries) {
       // Stay in 'waiting' to avoid re-detecting the stale rate limit on the next tick
@@ -412,8 +446,10 @@ export async function processOneTick(state, adapter, pane, config, isAlive, logg
 
 // Run the monitoring loop in-process against a terminal adapter (see src/launcher.js
 // for the PTY-backed adapter). Config and logger are injected so the caller controls
-// their lifetime. Returns a stop() handle; the loop also stops itself when isAlive()
-// reports Claude has exited. Unlike the old tmux build there is no forked daemon,
+// their lifetime. Returns { stop, rescan }; the loop also stops itself when isAlive()
+// reports Claude has exited. rescan() forces an immediate tick that re-parses the
+// full screen for a reset-time message (see the _rescanRequested handler above) —
+// wired to F5 in the launcher. Unlike the old tmux build there is no forked daemon,
 // no signal handling and no status-file publishing — the launcher owns the process,
 // the terminal, and shutdown.
 export function startMonitor(adapter, isAlive, { config, logger }) {
@@ -422,14 +458,29 @@ export function startMonitor(adapter, isAlive, { config, logger }) {
   const MAX_CONSECUTIVE_ERRORS = 10;
   let stopped = false;
   let timer = null;
+  let inFlight = false;
 
   const pane = adapter.sessionKey || 'pty';
   logger.info(`Monitor started (session ${pane})`).catch(() => {});
 
   const stop = () => { stopped = true; if (timer) { clearTimeout(timer); timer = null; } };
 
+  const rescan = () => {
+    if (stopped) return;
+    state._rescanRequested = true;
+    logger.info('Rescan requested (F5). Re-parsing the screen for a reset-time message...').catch(() => {});
+    // Kick an immediate tick unless one is already running (in which case the pending
+    // flag is consumed by the scheduled chain within one poll interval anyway).
+    if (!inFlight && timer) {
+      clearTimeout(timer);
+      timer = null;
+      loop().then(scheduleNext);
+    }
+  };
+
   const loop = async () => {
     if (stopped) return;
+    inFlight = true;
     try {
       const result = await processOneTick(state, adapter, pane, config, isAlive, logger);
       consecutiveErrors = 0;
@@ -452,7 +503,13 @@ export function startMonitor(adapter, isAlive, { config, logger }) {
       }
       if (result === 'menu-unreadable') await logger.warn('Rate-limit options menu detected but its layout could not be read; not pressing Enter (would risk confirming "Upgrade your plan"). Will recheck.');
       if (result === 'retried') await logger.info(`Sent retry message (attempt ${state.attempts})`);
-      if (result === 'user-continued') await logger.info('User already continued. Attempt counter reset.');
+      if (result === 'user-continued') await logger.info('Session resumed without our retry (limit banner gone or Claude working on two consecutive checks). Attempt counter reset.');
+      if (result === 'rescan-updated') {
+        const secs = Math.round((state.waitUntil - Date.now()) / 1000);
+        await logger.info(`Rescan: parsed "${state.lastRateLimitMessage}". Now waiting ${secs}s (retry budget reset).`);
+        state.lastRateLimitMessage = null;
+      }
+      if (result === 'rescan-none') await logger.warn('Rescan: no reset-time message found on the current screen. Wait state unchanged.');
       if (result === 'max-retries') await logger.warn(`Max retries (${config.maxRetries}) reached. Monitor still active but will not send further retries until rate limit clears.`);
       if (result === 'skipped-not-claude') await logger.warn(`Foreground is "${state._lastForeground}", not Claude. Skipping injection. (Add to foregroundCommands in ~/.claude-auto-retry.json if this is wrong)`);
       if (result === 'event-ignored') await logger.warn(`Ignored StopFailure marker with non-retryable error="${state._ignoredEventError}". If this is "rate_limit", an outdated hook is installed — re-run "claude-auto-retry install-hook".`);
@@ -485,6 +542,8 @@ export function startMonitor(adapter, isAlive, { config, logger }) {
         stop();
         await logger.error(`${MAX_CONSECUTIVE_ERRORS} consecutive errors. Stopping monitor.`).catch(() => {});
       }
+    } finally {
+      inFlight = false;
     }
   };
 
@@ -499,5 +558,5 @@ export function startMonitor(adapter, isAlive, { config, logger }) {
   };
   loop().then(scheduleNext);
 
-  return stop;
+  return { stop, rescan };
 }

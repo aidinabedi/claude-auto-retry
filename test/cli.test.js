@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseInvocation, MANAGEMENT_COMMANDS, stopFailureHookEntry } from '../bin/cli.js';
+import { isRescanKey } from '../src/launcher.js';
 
 describe('parseInvocation', () => {
   it('routes reserved barewords to management commands', () => {
@@ -49,8 +50,21 @@ describe('MANAGEMENT_COMMANDS', () => {
   it('is the exact reserved set (no install/uninstall — those were tmux-era)', () => {
     assert.deepEqual(
       [...MANAGEMENT_COMMANDS].sort(),
-      ['_stopfailure-hook', 'help', 'install-hook', 'logs', 'status', 'uninstall-hook', 'version'].sort(),
+      ['_stopfailure-hook', 'clear-logs', 'help', 'install-hook', 'logs', 'status', 'uninstall-hook', 'version'].sort(),
     );
+  });
+});
+
+describe('isRescanKey', () => {
+  it('matches a lone F5 / Ctrl+F5 chunk', () => {
+    assert.equal(isRescanKey('\x1b[15~'), true);
+    assert.equal(isRescanKey('\x1b[15;5~'), true);
+  });
+  it('does not match F5 embedded in other input (paste, bursts)', () => {
+    assert.equal(isRescanKey('a\x1b[15~'), false);
+    assert.equal(isRescanKey('\x1b[15~\x1b[15~'), false);
+    assert.equal(isRescanKey('\x1b[17~'), false);   // F6
+    assert.equal(isRescanKey('hello'), false);
   });
 });
 

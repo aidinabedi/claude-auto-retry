@@ -48,6 +48,14 @@ export function isPrintMode(args) {
   return args.includes('-p') || args.includes('--print');
 }
 
+// F5 (or Ctrl+F5) pressed on its own: the manual-rescan hotkey. Intercepted — never
+// forwarded to claude — and only when the chunk is exactly the key sequence, so F5
+// inside a paste or a burst of other input passes through untouched. Both regimes
+// produce these encodings (the pump's Tilde("15") and libuv's translation agree).
+export function isRescanKey(s) {
+  return s === '\x1b[15~' || s === '\x1b[15;5~';
+}
+
 
 // Build the monitor adapter over a PTY session — the PTY-backed stand-in for the tmux
 // adapter the state machine expects. The `pane` argument the state machine passes is
@@ -123,6 +131,17 @@ export async function launchInteractive(args) {
   let regime = compensate && isTTY ? 'pending' : 'passthrough';
   let pump = null;
 
+  // Assigned once the monitor starts (below); input handlers only fire afterwards.
+  // F5 asks the monitor to re-parse the screen for a missed reset time — see
+  // monitor.js's rescan handler. The bell is the only user-visible ack that doesn't
+  // disturb claude's rendering.
+  let monitor = null;
+  const triggerRescan = () => {
+    if (!monitor) return;
+    monitor.rescan();
+    if (process.stdout.isTTY) { try { process.stdout.write('\x07'); } catch { /* ignore */ } }
+  };
+
   // Mirror the PTY output to our real stdout (this is what the user sees — the full
   // TUI). The mouse-strip filter applies while pending and in fallback; in pump regime
   // mouse enables must reach the terminal, so the filter is bypassed after a drain.
@@ -135,6 +154,7 @@ export async function launchInteractive(args) {
   // pump regime Node's stdin is never resumed (the pump must be the only reader).
   const onStdin = (d) => {
     const s = d.toString('utf8');
+    if (isRescanKey(s)) { triggerRescan(); return; }
     if (regime !== 'fallback') { session.write(s); return; }
     const scrolled = translateAltScroll(s);
     session.write(scrolled ?? swapBackspaceEncoding(s));
@@ -162,7 +182,9 @@ export async function launchInteractive(args) {
       regime = 'pump';
       p.onData((data, resizes) => {
         for (const r of resizes) session.resize(r.cols, r.rows);
-        if (data) session.write(data);
+        if (!data) return;
+        if (isRescanKey(data)) { triggerRescan(); return; }
+        session.write(data);
       });
       p.onExit(() => {
         if (regime !== 'pump' || !session.isAlive()) return;
@@ -187,11 +209,11 @@ export async function launchInteractive(args) {
   process.on('SIGINT', onSigint);
 
   const adapter = buildPtyAdapter(session, sessionKey, config);
-  const stopMonitor = startMonitor(adapter, () => session.isAlive(), { config, logger });
+  monitor = startMonitor(adapter, () => session.isAlive(), { config, logger });
 
   return new Promise((resolve) => {
     session.onExit((info) => {
-      stopMonitor();
+      monitor.stop();
       // Pump cleanup first: killing it skips the C# loop's own restore, so put the
       // console input mode back to what the pump captured at startup. In pump regime
       // Node never entered raw mode, so there is nothing to setRawMode(false) from —

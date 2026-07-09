@@ -30,6 +30,14 @@ export function parseResetTime(text) {
   return null;
 }
 
+// A parsed reset time slightly in the PAST means the limit has already lifted — the
+// banner is stale (typically re-read at wait expiry after a transient 'user-continued',
+// or a scrollback line). Waiting for tomorrow's occurrence of that clock time would
+// idle the session for ~23h; retry after the margin instead. Beyond this window the
+// old wrap-to-tomorrow semantics stand (a much older time is more likely a genuinely
+// future reset whose date we can't read than a limit that lifted hours ago unnoticed).
+export const RECENT_PAST_GRACE_MS = 60 * 60_000;
+
 export function calculateWaitMs(parsed, marginSeconds = 60, fallbackHours = 5, now = new Date()) {
   if (!parsed) return (fallbackHours * 3600 + marginSeconds) * 1000;
 
@@ -100,12 +108,14 @@ export function calculateWaitMs(parsed, marginSeconds = 60, fallbackHours = 5, n
     if (d1 > 0 && d2 > 0) target = Math.min(d1, d2);
     else if (d1 > 0) target = d1;
     else if (d2 > 0) target = d2;
+    else if (Math.max(d1, d2) > -RECENT_PAST_GRACE_MS) target = 0; // just reset — margin only
     else target = d1 + 86400_000; // tomorrow
 
     return Math.max(0, target) + marginSeconds * 1000;
   }
 
   let diff = getTargetTimestamp(parsed.hour, parsed.minute) - now.getTime();
+  if (diff < 0 && diff > -RECENT_PAST_GRACE_MS) return marginSeconds * 1000; // just reset
   if (diff < 0) diff += 86400_000; // tomorrow
 
   return diff + marginSeconds * 1000;

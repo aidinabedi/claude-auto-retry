@@ -134,6 +134,24 @@ Handled across any menu layout (the option order varies by Claude Code version);
 tool locates the cursor and the "Stop and wait" option, and refuses to press Enter if
 the layout is unreadable.
 
+### Manual rescan — press F5
+
+If the menu (or any overlay) rendered **over** the reset-time banner at the moment the
+limit was detected, the tool can't parse the time and falls back to a flat
+`fallbackWaitHours` wait (5h by default). If you can see the real reset time on screen,
+press **F5** (or Ctrl+F5) in the session: the keypress is intercepted (never reaches
+Claude), the monitor re-parses the **entire** visible screen — not just the live tail —
+re-arms the wait to the parsed time, and resets the retry budget. You get a terminal
+bell as acknowledgment; the outcome is logged (`claude-auto-retry logs`):
+
+```
+[…] [INFO] Rescan requested (F5). Re-parsing the screen for a reset-time message...
+[…] [INFO] Rescan: parsed "resets 3pm (UTC)". Now waiting 9840s (retry budget reset).
+```
+
+Because the rescan reads the whole screen, only press it when the visible text actually
+shows the current limit message (old limit text quoted in the transcript would match too).
+
 ### API overload / transient errors — exponential backoff with jitter
 
 | Render | Example |
@@ -350,6 +368,7 @@ claude-auto-retry install-hook       # Install the StopFailure hook (event-drive
 claude-auto-retry uninstall-hook     # Remove the StopFailure hook
 claude-auto-retry status             # Show recent monitor activity
 claude-auto-retry logs               # Follow today's log (Ctrl+C to stop)
+claude-auto-retry clear-logs         # Delete all monitor log files
 claude-auto-retry version            # Print version
 claude-auto-retry help               # Show help
 ```
