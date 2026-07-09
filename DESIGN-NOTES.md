@@ -6,6 +6,22 @@ Anthropic API error schema, and Claude Code's hooks/transcript surfaces. Ordered
 leverage. Items marked **[done]** ship in the current version; the rest are proposals
 with enough detail to execute.
 
+> **Update (v0.6.0 — tmux → PTY port).** These notes were written for the tmux build and
+> keep its vocabulary ("`tmux capture-pane`", "pane", "`send-keys`", "`CLAUDE_AUTO_RETRY_PANE`",
+> "detached `monitor.js` processes", `/proc`). The detection design below is unchanged and
+> platform-independent, but the mechanism moved:
+> - Claude now runs in an **in-process PTY** (`@lydell/node-pty`); the scraper reads a
+>   rendered screen grid from a **headless terminal emulator** (`@xterm/headless`) instead
+>   of `tmux capture-pane`, and injects via PTY writes instead of `send-keys`.
+> - "Pane-keyed" markers are now **session-keyed** (`CLAUDE_AUTO_RETRY_SESSION`); §1's
+>   env-stamping approach is otherwise as described.
+> - §5 (operational pile-ups from detached forks) is largely **moot**: the monitor runs in
+>   the launcher process, so there is one monitor per session and it dies with it. There is
+>   no pane-id reuse and no `/proc` dependency (which also made this port possible on
+>   Windows). "Recycled pane id replays a stale marker" becomes "a stale marker from a prior
+>   run" — still bounded by `eventMaxAgeSeconds` + consume-on-read.
+> - Disconnect survival (tmux's headline benefit) is intentionally dropped in this port.
+
 ## 0. The core problem: we scrape a human-facing render
 
 The overload path detects a *terminal* API error by scraping `tmux capture-pane` and

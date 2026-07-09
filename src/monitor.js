@@ -1,10 +1,6 @@
 import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, detectSafeguard, safeguardMatch, isWorking } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
-import { capturePane, sendKeys, sendKey, getPaneCommand, isProcessForeground } from './tmux.js';
-import { loadConfig } from './config.js';
-import { createLogger } from './logger.js';
-import { readStopFailureEvent, clearStopFailureEvent, isRetryableError } from './events.js';
-import { writeStatus, clearStatus, sweepStaleStatus } from './status-file.js';
+import { isRetryableError } from './events.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 const SHELL_COMMANDS = ['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh'];
@@ -60,12 +56,12 @@ function resetSafeguard(state) {
   state._gaveUp = false;
 }
 
-// Foreground safety: is claude/node the foreground process (safe to send-keys), or did
+// Foreground safety: is claude/node the foreground process (safe to inject into), or did
 // it exit to a shell / is some other app focused? Returns { ok, fg, isShell }.
-async function checkForeground(tmuxAdapter, pane, config) {
-  const isFg = await tmuxAdapter.isClaudeForeground();
+async function checkForeground(adapter, pane, config) {
+  const isFg = await adapter.isClaudeForeground();
   if (isFg === true) return { ok: true, fg: null, isShell: false };
-  const fg = await tmuxAdapter.getPaneCommand(pane);
+  const fg = await adapter.getPaneCommand(pane);
   const fgCommands = config.foregroundCommands || DEFAULT_FOREGROUND_COMMANDS;
   if (fgCommands.some(c => fg.toLowerCase().includes(c))) return { ok: true, fg, isShell: false };
   const lc = (fg || '').toLowerCase();
@@ -100,10 +96,10 @@ function enterOverload(state, overload, rand) {
   return 'overload-detected';
 }
 
-export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, rand = Math.random) {
+export async function processOneTick(state, adapter, pane, config, isAlive, rand = Math.random) {
   if (!isAlive()) return 'exit';
 
-  const raw = await tmuxAdapter.capturePane(pane, 20);
+  const raw = await adapter.capturePane(pane, 20);
   const stripped = stripAnsi(raw);
   const overload = config.overload;
 
@@ -111,14 +107,14 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
   // Enter here confirms the highlighted default, which on some Claude Code versions
   // is "Upgrade your plan". Navigate to "Stop and wait for limit to reset" wherever
   // it sits, confirm it, then enter the normal (hours-scale) wait state.
-  if (tmuxAdapter.sendKey && isRateLimitOptionsPrompt(stripped, RATE_LIMIT_TAIL_LINES)
+  if (adapter.sendKey && isRateLimitOptionsPrompt(stripped, RATE_LIMIT_TAIL_LINES)
       && Date.now() >= (state._menuCooldownUntil || 0)) {
     const cooldown = config.pollIntervalSeconds * 1000 * 2;
 
     // Foreground safety: never send arrow/Enter keys unless Claude/node is the
     // foreground process. Otherwise, if the user switched the pane to another app
     // while the menu was up, we'd drive that app's UI instead.
-    const fgOk = await checkForeground(tmuxAdapter, pane, config);
+    const fgOk = await checkForeground(adapter, pane, config);
     if (!fgOk.ok) {
       state._lastForeground = fgOk.fg;
       state._menuCooldownUntil = Date.now() + cooldown;
@@ -133,10 +129,10 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     }
     const key = steps >= 0 ? 'Down' : 'Up';
     for (let i = 0; i < Math.abs(steps); i++) {
-      await tmuxAdapter.sendKey(pane, key);
+      await adapter.sendKey(pane, key);
       await new Promise(r => setTimeout(r, 80));
     }
-    await tmuxAdapter.sendKey(pane, 'Enter');
+    await adapter.sendKey(pane, 'Enter');
     // Parse the reset time straight from the menu text, so the wait does not depend
     // on the limit banner still being visible afterward.
     const message = findRateLimitMessage(stripped, config.customPatterns);
@@ -167,7 +163,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       // Stay in 'waiting' to avoid re-detecting the stale rate limit on the next tick
       // and creating an infinite max-retries loop. This IS a give-up (no further
       // retries will be sent while the banner persists) even though `status` stays
-      // 'waiting' — flagged so external consumers (tmux status bar) don't render a
+      // 'waiting' — flagged so external status readers don't render a
       // perpetually-resetting countdown for a monitor that has stopped acting.
       state.waitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 12);
       state._gaveUp = true;
@@ -179,9 +175,9 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // so we use `ps -o stat=` to check the '+' (foreground) flag directly.
     // `true` short-circuits past pane_current_command (fixes macOS).
     // `false`/`null` falls back to pane_current_command for safety.
-    const isFg = await tmuxAdapter.isClaudeForeground();
+    const isFg = await adapter.isClaudeForeground();
     if (isFg !== true) {
-      const fg = await tmuxAdapter.getPaneCommand(pane);
+      const fg = await adapter.getPaneCommand(pane);
       const fgCommands = config.foregroundCommands || DEFAULT_FOREGROUND_COMMANDS;
       if (!fgCommands.some(c => fg.toLowerCase().includes(c))) {
         state.waitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 6);
@@ -194,7 +190,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // (e.g. pane destroyed) still consumes a retry and avoids tight-loop errors.
     state.attempts++;
     state.waitUntil = Date.now() + 30_000;
-    await tmuxAdapter.sendKeys(pane, config.retryMessage);
+    await adapter.sendKeys(pane, config.retryMessage);
     return 'retried';
   }
 
@@ -211,13 +207,13 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       // A usage limit appearing mid-wait still takes precedence.
       if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) { resetOverload(state); return enterUsageWait(state, stripped, config); }
 
-      const foregroundOk = await checkForeground(tmuxAdapter, pane, config);
+      const foregroundOk = await checkForeground(adapter, pane, config);
       if (!foregroundOk.ok) {
         state._lastForeground = foregroundOk.fg;
         state.viaEvent = false; state.status = 'monitoring';
         if (foregroundOk.isShell && overload.relaunchOnExit) {
           state.overloadAttempts++;
-          await tmuxAdapter.sendKeys(pane, overload.relaunchCommand);
+          await adapter.sendKeys(pane, overload.relaunchCommand);
           return 'overload-relaunched';
         }
         return foregroundOk.isShell ? 'overload-exited-to-shell' : 'skipped-not-claude';
@@ -226,7 +222,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       state.overloadAttempts++;          // next failure backs off further
       state.viaEvent = false;
       state.status = 'monitoring';
-      await tmuxAdapter.sendKeys(pane, overload.retryMessage);
+      await adapter.sendKeys(pane, overload.retryMessage);
       return 'overload-retried';
     }
 
@@ -263,11 +259,11 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
 
     // Foreground safety, reused from the usage path: only act when claude/node is
     // the foreground process. (See the gating decision in the README.)
-    const isFg = await tmuxAdapter.isClaudeForeground();
+    const isFg = await adapter.isClaudeForeground();
     let foregroundOk = isFg === true;
     let fg = null;
     if (!foregroundOk) {
-      fg = await tmuxAdapter.getPaneCommand(pane);
+      fg = await adapter.getPaneCommand(pane);
       const fgCommands = config.foregroundCommands || DEFAULT_FOREGROUND_COMMANDS;
       foregroundOk = fgCommands.some(c => fg.toLowerCase().includes(c));
     }
@@ -283,7 +279,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
         const w = nextOverloadWaitMs(state.overloadAttempts, overload, rand);
         state.overloadTotalWaitMs += w;
         state.overloadWaitUntil = Date.now() + w;
-        await tmuxAdapter.sendKeys(pane, overload.relaunchCommand);
+        await adapter.sendKeys(pane, overload.relaunchCommand);
         return 'overload-relaunched';
       }
       state.overloadWaitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 6);
@@ -296,7 +292,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     const w = nextOverloadWaitMs(state.overloadAttempts, overload, rand);
     state.overloadTotalWaitMs += w;
     state.overloadWaitUntil = Date.now() + w;
-    await tmuxAdapter.sendKeys(pane, overload.retryMessage);
+    await adapter.sendKeys(pane, overload.retryMessage);
     return 'overload-retried';
   }
 
@@ -337,7 +333,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     }
 
     // Foreground safety: only send when claude/node is foreground.
-    const fg = await checkForeground(tmuxAdapter, pane, config);
+    const fg = await checkForeground(adapter, pane, config);
     if (!fg.ok) {
       state._lastForeground = fg.fg;
       state.safeguardWaitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 6);
@@ -347,7 +343,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // Increment + schedule BEFORE send so a send failure still consumes the slot.
     state.safeguardAttempts++;
     state.safeguardWaitUntil = Date.now() + (safeguard.retryDelaySeconds * 1000);
-    await tmuxAdapter.sendKeys(pane, safeguard.retryMessage);
+    await adapter.sendKeys(pane, safeguard.retryMessage);
     return 'safeguard-retried';
   }
 
@@ -360,8 +356,8 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
   // Event-driven overload (authoritative; see DESIGN-NOTES §1). A StopFailure marker for
   // this pane means the turn ended in a retryable API error — no scraping, no ambiguity.
   // Latches eventMode so the scraper path is disabled once we know the hook is live.
-  if (overload && overload.enabled && tmuxAdapter.readEvent) {
-    const ev = await tmuxAdapter.readEvent();
+  if (overload && overload.enabled && adapter.readEvent) {
+    const ev = await adapter.readEvent();
     if (ev) {
       // Consume-side guard: trust no writer. The hook entry in settings.json freezes the
       // cli.js path + matcher at install time, so an OLDER hook binary (whose matcher and
@@ -369,12 +365,12 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       // Consume-and-ignore anything non-retryable, and do NOT latch eventMode off it —
       // a misclassified marker must not start a backoff nor disable the scraper paths.
       if (!isRetryableError(ev.error)) {
-        await tmuxAdapter.clearEvent();             // consume so it can't re-fire
+        await adapter.clearEvent();             // consume so it can't re-fire
         state._ignoredEventError = ev.error;
         return 'event-ignored';
       }
       state.eventMode = true;
-      await tmuxAdapter.clearEvent();               // consume
+      await adapter.clearEvent();               // consume
       if (isWorking(stripped)) { resetOverload(state); return 'overload-cleared'; } // self-recovered
       const capMs = overload.maxTotalWaitMinutes * 60_000;
       if (state.overloadTotalWaitMs >= capMs) { state._gaveUp = true; return 'overload-gave-up'; }
@@ -414,73 +410,36 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
   return 'monitoring';
 }
 
-export async function startMonitor(pane, pid) {
-  const config = await loadConfig();
-  const logger = createLogger();
+// Run the monitoring loop in-process against a terminal adapter (see src/launcher.js
+// for the PTY-backed adapter). Config and logger are injected so the caller controls
+// their lifetime. Returns a stop() handle; the loop also stops itself when isAlive()
+// reports Claude has exited. Unlike the old tmux build there is no forked daemon,
+// no signal handling and no status-file publishing — the launcher owns the process,
+// the terminal, and shutdown.
+export function startMonitor(adapter, isAlive, { config, logger }) {
   const state = createMonitorState();
   let consecutiveErrors = 0;
   const MAX_CONSECUTIVE_ERRORS = 10;
+  let stopped = false;
+  let timer = null;
 
-  await logger.info(`Monitor started for pane ${pane} (claude PID: ${pid})`);
+  const pane = adapter.sessionKey || 'pty';
+  logger.info(`Monitor started (session ${pane})`).catch(() => {});
 
-  // Best-effort GC of status files left behind by monitors that died without cleaning up
-  // (SIGKILL, host sleep/crash). Runs once per monitor start, not per tick.
-  sweepStaleStatus().catch(() => {});
-
-  let shuttingDown = false;
-  const shutdown = (signal) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    // Best-effort: fire the unlink and exit without waiting on the promise. Signal
-    // handlers are not the place to await — a hung filesystem must not block the
-    // process from actually terminating on SIGTERM/SIGINT.
-    clearStatus(pane).catch(() => {}).finally(() => {
-      process.exit(signal === 'SIGINT' ? 130 : 143);
-    });
-  };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
-
-  const eventMaxAgeMs = (config.overload?.eventMaxAgeSeconds || 120) * 1000;
-  const tmuxAdapter = {
-    capturePane, sendKeys, sendKey, getPaneCommand,
-    isClaudeForeground: () => isProcessForeground(pid),
-    // Pane-keyed StopFailure markers (written by the hook). The daemon owns the pane,
-    // so this is a direct read — no session-id resolution needed.
-    readEvent: () => readStopFailureEvent(pane, eventMaxAgeMs),
-    clearEvent: () => clearStopFailureEvent(pane),
-  };
-  const isAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const stop = () => { stopped = true; if (timer) { clearTimeout(timer); timer = null; } };
 
   const loop = async () => {
+    if (stopped) return;
     try {
-      const result = await processOneTick(state, tmuxAdapter, pane, config, isAlive);
+      const result = await processOneTick(state, adapter, pane, config, isAlive);
       consecutiveErrors = 0;
 
       if (result === 'exit') {
-        await clearStatus(pane).catch(() => {});
-        await logger.info('Claude exited. Monitor shutting down.');
-        process.exit(0);
+        stop();
+        await logger.info('Claude exited. Monitor stopping.').catch(() => {});
+        return;
       }
 
-      // Published for external consumers (e.g. a tmux status-bar segment) — best-effort,
-      // never let a write failure interrupt the monitor loop. pollIntervalSeconds travels
-      // with every snapshot so the reader can derive its own staleness threshold instead
-      // of assuming a fixed interval (a configured pollIntervalSeconds far above the old
-      // hardcoded 30s stale-check would otherwise make a healthy monitor's segment blank
-      // out for a large fraction of every tick). gaveUp flags the terminal states where
-      // `status` alone doesn't tell a reader the monitor has stopped acting.
-      await writeStatus(pane, {
-        status: state.status,
-        waitUntil: Math.floor(state.waitUntil / 1000),
-        overloadWaitUntil: Math.floor(state.overloadWaitUntil / 1000),
-        safeguardWaitUntil: Math.floor(state.safeguardWaitUntil / 1000),
-        attempts: state.attempts,
-        overloadAttempts: state.overloadAttempts,
-        safeguardAttempts: state.safeguardAttempts,
-        pollIntervalSeconds: config.pollIntervalSeconds,
-        gaveUp: !!state._gaveUp,
-      }).catch(() => {});
       if (result === 'waiting' && state.lastRateLimitMessage) {
         const secs = Math.round((state.waitUntil - Date.now()) / 1000);
         await logger.info(`Rate limit detected: "${state.lastRateLimitMessage}". Waiting ${secs}s...`);
@@ -495,7 +454,7 @@ export async function startMonitor(pane, pid) {
       if (result === 'retried') await logger.info(`Sent retry message (attempt ${state.attempts})`);
       if (result === 'user-continued') await logger.info('User already continued. Attempt counter reset.');
       if (result === 'max-retries') await logger.warn(`Max retries (${config.maxRetries}) reached. Monitor still active but will not send further retries until rate limit clears.`);
-      if (result === 'skipped-not-claude') await logger.warn(`Foreground is "${state._lastForeground}", not Claude. Skipping send-keys. (Add to foregroundCommands in ~/.claude-auto-retry.json if this is wrong)`);
+      if (result === 'skipped-not-claude') await logger.warn(`Foreground is "${state._lastForeground}", not Claude. Skipping injection. (Add to foregroundCommands in ~/.claude-auto-retry.json if this is wrong)`);
       if (result === 'event-ignored') await logger.warn(`Ignored StopFailure marker with non-retryable error="${state._ignoredEventError}". If this is "rate_limit", an outdated hook is installed — re-run "claude-auto-retry install-hook".`);
       if (result === 'overload-detected') {
         const secs = Math.round((state.overloadWaitUntil - Date.now()) / 1000);
@@ -523,9 +482,8 @@ export async function startMonitor(pane, pid) {
       consecutiveErrors++;
       await logger.error(`Monitor tick error: ${err.message}`).catch(() => {});
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        await clearStatus(pane).catch(() => {});
-        await logger.error(`${MAX_CONSECUTIVE_ERRORS} consecutive errors. Pane likely destroyed. Exiting.`).catch(() => {});
-        process.exit(1);
+        stop();
+        await logger.error(`${MAX_CONSECUTIVE_ERRORS} consecutive errors. Stopping monitor.`).catch(() => {});
       }
     }
   };
@@ -533,16 +491,13 @@ export async function startMonitor(pane, pid) {
   // Use recursive setTimeout instead of setInterval to prevent concurrent
   // tick execution when a tick takes longer than the poll interval.
   const scheduleNext = () => {
-    setTimeout(async () => {
+    if (stopped) return;
+    timer = setTimeout(async () => {
       await loop();
       scheduleNext();
     }, config.pollIntervalSeconds * 1000);
   };
   loop().then(scheduleNext);
-}
 
-// Direct execution: node monitor.js <pane> <pid>
-const isDirectRun = process.argv[1]?.endsWith('monitor.js') && process.argv.length >= 4;
-if (isDirectRun) {
-  startMonitor(process.argv[2], parseInt(process.argv[3], 10));
+  return stop;
 }

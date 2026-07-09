@@ -1,15 +1,15 @@
 # claude-auto-retry
 
-> Zero-dependency CLI that auto-retries Claude Code sessions. When a subscription
-> usage/session limit hits ("You've hit your session limit · resets 2am"), it waits
-> until the printed reset time and sends "continue" automatically. Sustained API
-> overload (`API Error: 529 … overloaded_error`, 500/502/503/504) gets exponential
-> backoff with jitter; safeguard/AUP false positives ("safeguards flagged this
-> message") get a bounded immediate re-send. tmux-based, so it keeps working after
-> you disconnect.
+> Cross-platform CLI (Windows/macOS/Linux) that auto-retries Claude Code sessions. When a
+> subscription usage/session limit hits ("You've hit your session limit · resets 2am"), it
+> waits until the printed reset time and sends "continue" automatically. Sustained API
+> overload (`API Error: 529 … overloaded_error`, 500/502/503/504) gets exponential backoff
+> with jitter; safeguard/AUP false positives ("safeguards flagged this message") get a
+> bounded immediate re-send. Hosts Claude in an in-process PTY (no tmux) — so it does NOT
+> survive a disconnect.
 
-Install: `npm i -g claude-auto-retry && claude-auto-retry install` — then use `claude`
-as usual.
+Install: `npm i -g claude-auto-retry` — then run `claude-auto-retry` in place of `claude`
+(all args pass through).
 
 Key facts:
 
@@ -20,12 +20,15 @@ Key facts:
   `<model>'s safeguards flagged this message`.
 - Navigates the `/rate-limit-options` menu to "Stop and wait for limit to reset"
   across any menu layout; never confirms "Upgrade your plan".
-- Safe by design: verifies Claude is the foreground process before injecting keys,
-  stops the moment the user (or Claude) resumes, and detection is anchored to the live
-  pane tail so quoted errors in scrollback can't trigger a retry.
+- Hosts Claude in a pseudo-terminal (`@lydell/node-pty`, ConPTY on Windows) and reads its
+  rendered screen via a headless terminal emulator (`@xterm/headless`) — the cross-platform
+  replacement for `tmux capture-pane` + `send-keys`.
+- Safe by design: injects only while Claude is alive and idle, stops the moment the user
+  (or Claude) resumes, and detection is anchored to the live screen tail so quoted errors
+  in scrollback can't trigger a retry.
 - Timezone- and DST-aware reset-time parsing; `--print` mode supported; optional
   config at `~/.claude-auto-retry.json` with safe fallbacks for invalid values.
-- No runtime dependencies; Node >= 18; MIT license; 200+ tests.
+- Two prebuilt dependencies (node-pty, xterm-headless); Node >= 18; MIT license; 200+ tests.
 
 ## Docs
 
@@ -36,7 +39,7 @@ Key facts:
 ## Install for a user (agent-friendly, non-interactive)
 
 - `npm install -g claude-auto-retry`
-- `claude-auto-retry install` — shell wrapper (+ tmux if missing); takes effect in new shells
+- Run `claude-auto-retry [args]` in place of `claude` — no shell wrapper, no `install` step
 - `claude-auto-retry install-hook` — recommended: event-driven overload detection via Claude Code's StopFailure hook
 - Verify: `claude-auto-retry status`
-- Remove: `claude-auto-retry uninstall` and `claude-auto-retry uninstall-hook`
+- Remove: `claude-auto-retry uninstall-hook` and `npm uninstall -g claude-auto-retry`

@@ -4,7 +4,7 @@
 
 When Claude Code shows *"5-hour limit reached - resets 3pm"*, this tool waits for the reset and sends "continue" automatically. You come back to find your work done.
 
-**No dependencies. No workflow change. Just install and forget.**
+**Cross-platform (Windows, macOS, Linux). No tmux. Just install and run `claude-auto-retry`.**
 
 [![npm version](https://img.shields.io/npm/v/claude-auto-retry.svg)](https://www.npmjs.com/package/claude-auto-retry)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -28,63 +28,79 @@ Claude stops. You have to wait hours, come back, and type "continue". If you're 
 
 ```bash
 npm i -g claude-auto-retry
-claude-auto-retry install
 ```
 
-That's it. Type `claude` as you always do. When the rate limit hits, the tool:
+Then start Claude Code through the wrapper — everywhere you'd type `claude`, type `claude-auto-retry` instead:
 
-1. Detects the rate limit message in the terminal
+```bash
+claude-auto-retry              # instead of: claude
+claude-auto-retry --model opus # any claude args pass straight through
+```
+
+That's it. When the rate limit hits, the tool:
+
+1. Detects the rate limit message in Claude's output
 2. Parses the reset time (timezone-aware)
 3. Waits until the limit resets + 60s margin
-4. Verifies Claude is still the foreground process
+4. Verifies Claude is still running and idle
 5. Sends "continue" automatically
 
 You come back to find your task completed.
 
 ## How it Works
 
+`claude-auto-retry` hosts Claude Code inside a **pseudo-terminal (PTY)** in the same
+process, so it can watch what Claude renders and type into it — the same two things tmux
+used to provide, but built in and cross-platform.
+
 ```
-You type "claude"
+You run "claude-auto-retry [args]"
        │
        ▼
-  Shell function (injected in .bashrc/.zshrc)
+  Launcher (one process)
        │
-       ├─ Already in tmux? ──▶ Start background monitor
-       │                        Launch claude with full TUI
+       ├─ Spawns `claude` in a PTY (ConPTY on Windows, forkpty on macOS/Linux)
+       │     via @lydell/node-pty — Claude's full TUI renders exactly as normal
        │
-       └─ Not in tmux? ──▶ Create tmux session transparently
-                             Launch claude + monitor inside
-                             Attach (looks the same to you)
-
-  MONITOR (background, ~0% CPU):
+       ├─ Wires your keyboard → PTY  and  PTY output → your screen
+       │     (you can't tell the difference from running `claude` directly)
        │
-       ├─ Polls tmux pane every 5 seconds
-       ├─ Detects rate limit text
-       ├─ Parses reset time from message
-       ├─ Waits until reset + safety margin
-       ├─ Verifies Claude is still the foreground process
-       └─ Sends "continue" via tmux send-keys
+       └─ Runs the MONITOR in-process (~0% CPU):
+               ├─ Feeds Claude's output into a headless terminal emulator
+               │     (@xterm/headless) to get a clean rendered screen
+               ├─ Every 5s, scans the screen tail for a rate-limit banner
+               ├─ Parses the reset time from the message
+               ├─ Waits until reset + safety margin
+               ├─ Verifies Claude is still alive and idle
+               └─ Types "continue" into the PTY
 ```
 
-### Why tmux?
+### Why a PTY instead of tmux?
 
-When you disconnect (SSH drops, close terminal, laptop sleeps), **tmux keeps running**. The monitor keeps waiting. When you reconnect with `tmux attach`, you find Claude working on your task. This is the key advantage over wrapper scripts.
+Claude Code is an [Ink](https://github.com/vadimdemedes/ink)/React terminal UI: it needs
+a **real terminal** to render and to accept keystrokes. tmux provided one and let the
+session survive a disconnect — but tmux doesn't exist on Windows. A PTY gives Claude a
+real terminal on every platform (Windows included), and lets the monitor read the screen
+and inject keys without any external program.
+
+The trade-off: because the PTY lives inside the launcher process, the session **does not
+survive a disconnect** (closing the terminal or sleeping the laptop ends it). If you need
+disconnect survival on macOS/Linux, run `claude-auto-retry` inside your own tmux/screen
+session — but that is no longer required for the tool to work.
 
 ## Features
 
-- **Zero workflow change** — same `claude` command, same TUI, same everything
-- **Works with and without tmux** — auto-creates tmux session if you're not already in one
-- **Auto-installs tmux** if missing (apt, dnf, brew, pacman, apk)
+- **Drop-in** — `claude-auto-retry` forwards all arguments to `claude`; same TUI, same everything
+- **Cross-platform** — Windows, macOS, and Linux, from one code path (no tmux, no shell wrapper)
+- **No native build step** — `@lydell/node-pty` ships prebuilt binaries for every platform
 - **Timezone-aware** — parses reset times with full IANA timezone support (including half-hour offsets)
 - **DST-safe** — iterative offset correction handles daylight saving transitions
-- **Safe send-keys** — verifies Claude is still the foreground process before injecting text
+- **Safe injection** — verifies Claude is still alive and idle before typing "continue"
 - **Overload backoff** — detects sustained API overload (`429/500/502/503/504/529`) and retries on a configurable exponential backoff with jitter and a cumulative-wait cap, distinct from the usage-reset path ([details](#overload-backoff))
 - **Safeguard retry** — auto-continues past an AUP-safeguard false-positive (often transient), capped at a few tries so a sticky flag can't loop ([details](#safeguard-retry))
-- **tmux status bar indicator** — see at a glance whether a pane is being monitored, waiting on a reset, backing off from overload, or has given up ([details](#tmux-status-bar-indicator))
 - **`--print` mode support** — buffers output, retries cleanly for piped/scripted usage
 - **Configurable** — retry count, wait margin, custom patterns, retry message
 - **Config validation** — bad config values fall back to safe defaults instead of crashing
-- **Zero dependencies** — pure Node.js, no `node_modules`
 
 ## Messages Detected (verbatim)
 
@@ -161,9 +177,25 @@ Optional. Create `~/.claude-auto-retry.json`:
 
 All fields optional. Invalid values fall back to defaults automatically.
 
+To point at a different `claude` binary (e.g. a specific install or a wrapper), set
+`CLAUDE_AUTO_RETRY_CLAUDE_BIN=/path/to/claude`. Otherwise the tool resolves `claude` from
+your `PATH` (handling Windows `.exe`/`.cmd`/`.ps1` shims automatically).
+
+On Windows the launcher reads console input through a **native input pump** — a small
+C# record reader compiled in-memory by the in-box Windows PowerShell (no SDK, no build
+step). Node's own console layer discards mouse events and delivers legacy key
+encodings; the pump reads raw `INPUT_RECORD`s instead and encodes correct xterm bytes
+for both keys and mouse. Result: Backspace/Ctrl+Backspace behave normally, and claude's
+own mouse wheel scrolling and drag-selection work exactly like an unwrapped session.
+If the pump can't start (PowerShell missing or blocked, piped stdin), the launcher
+falls back to compensations: it swaps the legacy Backspace byte encodings, strips
+claude's mouse-tracking requests, and translates wheel-generated arrow bursts into
+PgUp/PgDn so the wheel still scrolls the transcript. Set `CLAUDE_AUTO_RETRY_RAW_IO=1`
+to disable all of this (raw passthrough).
+
 ## Overload backoff
 
-Separate from subscription rate limits, this fork also detects **sustained API
+Separate from subscription rate limits, this tool also detects **sustained API
 overload** — Claude Code's own terminal `API Error: <code>` line for the retryable
 set (`429 / 500 / 502 / 503 / 504 / 529`, or an `overloaded_error` JSON body) — and
 retries on an **exponential backoff** instead of waiting for a usage reset. The two
@@ -171,7 +203,7 @@ paths never collide; usage limits always take precedence.
 
 > **Sustained only.** Claude Code already retries transient 5xx/529 internally
 > with its own backoff. This feature fires only when those internal retries are
-> exhausted and a *terminal* error is left in the pane. It should rarely trigger.
+> exhausted and a *terminal* error is left on screen. It should rarely trigger.
 
 > **Terminal vs. transient.** Claude Code renders an in-progress retry as the
 > *parens* form `API Error (529 …) · Retrying in 5s · attempt 3/10`, and the final
@@ -181,14 +213,13 @@ paths never collide; usage limits always take precedence.
 
 > **Anchored, tail-only matching (why it won't fire on your code).** Patterns are
 > case-insensitive **regexes** matched against only the **last 12 lines** of the
-> pane — never the full scrollback. They are anchored to Claude Code's `API Error:
-> <code>` render, so a bare `503` in code you're editing (`res.status(503)`), a
-> port number, a quoted log, or a `status.claude.com` link in a comment will **not**
+> rendered screen — never the full scrollback. They are anchored to Claude Code's
+> `API Error: <code>` render, so a bare `503` in code you're editing (`res.status(503)`),
+> a port number, a quoted log, or a `status.claude.com` link in a comment will **not**
 > trip detection. The one residual: a live tail that literally contains
 > `API Error: 529` (e.g. editing this tool, or docs about Claude errors) will match —
-> set `"enabled": false` while doing that. (Earlier versions matched bare status
-> numbers across the whole capture, which injected spurious retries during ordinary
-> web-dev sessions.) For a structured, ambiguity-free trigger see `DESIGN-NOTES.md`.
+> set `"enabled": false` while doing that. For a structured, ambiguity-free trigger see
+> `DESIGN-NOTES.md`.
 
 Configured under an `overload` block (shown with its defaults):
 
@@ -211,7 +242,7 @@ Configured under an `overload` block (shown with its defaults):
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled` | `true` | Turn the overload path on/off |
-| `patterns` | (see above) | Case-insensitive **regexes** matching a terminal overload error in the pane tail (last 12 lines) |
+| `patterns` | (see above) | Case-insensitive **regexes** matching a terminal overload error in the screen tail (last 12 lines) |
 | `backoffSeconds` | `[30,60,120,240,300]` | Wait before each retry; index `i` for attempt `i` |
 | `steadyStateSeconds` | `300` | Wait once the `backoffSeconds` array is exhausted |
 | `jitterPct` | `15` | ±% jitter applied to every wait (clamped 0–100) |
@@ -237,8 +268,8 @@ claude-auto-retry install-hook /path/to/config  # repeat per CLAUDE_CONFIG_DIR y
 ```
 
 This adds a `StopFailure` hook (matcher `overloaded|server_error`) that writes a
-pane-keyed marker the monitor consumes — no terminal scraping, so it cannot
-false-positive on code or scrollback. Sessions launched via the wrapper **after**
+session-keyed marker the monitor consumes — no terminal scraping, so it cannot
+false-positive on code or scrollback. Sessions launched via `claude-auto-retry` **after**
 installing the hook use it automatically; the first marker latches event mode and
 disables the scraper for that session. Sessions without the hook (or pre-install) fall
 back to the anchored scraper. Remove with `uninstall-hook`. See `DESIGN-NOTES.md` for
@@ -250,21 +281,18 @@ the architecture.
 > path above, not the overload path. Routing it through the hook would fire premature
 > retries against a session that's simply out of quota.
 
-### Gating decision (alive-at-prompt vs exited-to-shell)
+### Gating decision (alive-and-idle vs exited)
 
 A transient API error in interactive Claude Code surfaces inline and leaves the
-process **alive at its prompt** — it does not exit to the shell. So the default,
-robust behavior reuses the existing usage-limit mechanism: only retry when the
-foreground process is `claude`/`node` and the session is **idle, not working**
-(the `esc to interrupt` footer is absent). Retrying mid-internal-retry would
-double-drive the session, so that case is deferred, never sent.
+process **alive at its prompt** — it does not exit. So the default, robust behavior
+reuses the existing usage-limit mechanism: only retry when Claude is **alive, idle, and
+not working** (the `esc to interrupt` footer is absent). Retrying mid-internal-retry
+would double-drive the session, so that case is deferred, never sent.
 
-If a `500` ever *does* drop you to the shell, `send-keys` is correctly blocked by
-the foreground check (it never types into bash), and the tool logs
-`overload-exited-to-shell` rather than masking it. Auto-relaunch is **off by
-default** — blindly typing `claude --continue` into a shell the user may be using
-is worse than surfacing the stall. Set `relaunchOnExit: true` (and adjust
-`relaunchCommand`) only if you actually observe shell-exits on overload.
+If a `500` ever causes Claude to exit, the PTY closes and `claude-auto-retry` exits with
+it (there is no lingering shell to type into, as there was with tmux). Auto-relaunch is
+**off by default**; `relaunchOnExit`/`relaunchCommand` remain configurable for parity but
+rarely apply in the single-process model.
 
 ## Safeguard retry
 
@@ -284,7 +312,7 @@ repeats — but only up to `maxRetries` times, then **gives up loudly** (logged)
 than looping. A sticky flag means the content/model combination is genuinely blocked;
 switch models with `/model` or rephrase.
 
-Detection is tail-anchored (last 12 pane lines) like the overload path, and a match
+Detection is tail-anchored (last 12 screen lines) like the overload path, and a match
 additionally requires the `API Error` render line nearby — so the phrases appearing in
 scrollback or in a conversation *about* safeguards won't trigger it.
 
@@ -305,85 +333,30 @@ Configured under a `safeguard` block (defaults shown):
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled` | `true` | Turn the safeguard-retry path on/off |
-| `patterns` | (see above) | Case-insensitive regexes marking the safeguard render (matched in the pane tail, near an `API Error` line) |
+| `patterns` | (see above) | Case-insensitive regexes marking the safeguard render (matched in the screen tail, near an `API Error` line) |
 | `maxRetries` | `3` | Re-send attempts before giving up — kept small; retrying a sticky flag won't help |
 | `retryDelaySeconds` | `8` | Wait between re-sends |
 | `retryMessage` | `"continue"` | Message sent to nudge past the flag |
 
 Usage limits always take precedence; the safeguard path only acts when Claude is idle
-(no `esc to interrupt` footer) and the foreground process is `claude`/`node`.
-## tmux status bar indicator
-
-The monitor writes a small JSON snapshot per pane on every poll tick, so you can tell
-at a glance — without checking logs — whether a pane is being watched, waiting out a
-usage-limit reset, backing off from overload or a safeguard flag, or has given up.
-
-Add a segment to `status-right` (or `status-left`) in `~/.tmux.conf` that shells out to
-the bundled reader script, passing the current pane id **and** the server's socket path:
-
-```tmux
-set -g status-interval 5
-set -g status-right "#(~/.local/lib/node_modules/claude-auto-retry/bin/tmux-status.sh '#{pane_id}' '#{socket_path}') | %Y-%m-%d %H:%M"
-```
-
-**Use an absolute path, not the bare command name.** `#()` commands run inside the tmux
-*server's* own environment, not the environment of whichever shell you attached from —
-if the server was started before your shell rc added `npm`/`nvm`'s bin directory to
-`PATH` (e.g. tmux auto-started at login, or by another program), the bare command name
-resolves to nothing and the segment stays permanently blank with no error anywhere.
-Find your actual install path with `which claude-auto-retry-tmux-status` (run it in a
-normal shell, then hardcode that path in `.tmux.conf`) if it differs from the example
-above. If you use nvm and switch Node versions, re-check the path.
-
-`tmux` substitutes `#{pane_id}` and `#{socket_path}` itself before running the command
-(these are tmux format variables, resolved at expansion time — not environment
-variables the script has to go looking for), so the segment always reflects whichever
-pane you're looking at, correctly scoped to the tmux server it belongs to. The
-`socket_path` argument matters if you ever run more than one tmux server on the same
-machine (e.g. `tmux -L work`, `tmux -L personal`, or two users' default servers on a
-shared host): pane ids like `%2` are only unique *within* a server, so without it two
-different servers' `%2` panes would render each other's status. Always pass it: the
-monitor keys each status file by the socket path it inherits from `$TMUX`, so a
-single-argument config looks under a shared `default` key the monitor never writes to,
-and the segment simply stays blank.
-
-It prints:
-
-| Pane state | Indicator |
-|------------|-----------|
-| Actively monitoring | `🟢AR` |
-| Waiting on a usage-limit reset | `⏳AR 1h30m` |
-| Backing off from overload | `🟠AR 45s` |
-| Retrying past a safeguard/AUP false-positive | `🛡AR 8s` |
-| Given up — max retries/backoff cap reached; no further automatic action on this pane | `🔴AR` |
-| No monitor for this pane, or the status file is stale (monitor process died without cleaning up) | *(nothing)* |
-
-`🔴AR` overrides whatever the underlying status would otherwise render. Several
-give-up paths intentionally leave the monitor's internal status at whatever it was
-when it stopped acting (so the scraper/event logic doesn't re-detect its own stale
-error next tick) — without an explicit `gaveUp` flag in the snapshot, the status bar
-would keep showing a live `🟢`/`⏳`/`🟠` indicator for a monitor that will not act
-again on this pane until the underlying condition clears on its own.
-
-Staleness is derived from each snapshot's own `pollIntervalSeconds` (age > 2× the
-monitor's configured poll interval) rather than a fixed constant, so a healthy monitor
-running with a longer `pollIntervalSeconds` doesn't have its segment blank out for a
-large fraction of every tick.
-
-The script (`bin/tmux-status.sh`) is pure POSIX shell with no dependencies (no `jq`,
-no `node`), so it's cheap to run every few seconds from every attached client.
-`status-interval` defaults to 15s in tmux; dropping it to `5` (matching the monitor's
-default `pollIntervalSeconds`) keeps the overload countdown responsive.
+(no `esc to interrupt` footer).
 
 ## CLI Commands
 
 ```bash
-claude-auto-retry install     # Install shell wrapper + tmux
-claude-auto-retry uninstall   # Remove shell wrapper
-claude-auto-retry status      # Show monitor activity + last log entries
-claude-auto-retry logs        # Tail today's log file in real-time
-claude-auto-retry version     # Print version
+claude-auto-retry [claude args...]   # Launch Claude Code with the auto-retry monitor
+claude-auto-retry -p "..."           # Print/piped mode with transparent retry
+claude-auto-retry install-hook       # Install the StopFailure hook (event-driven detection)
+claude-auto-retry uninstall-hook     # Remove the StopFailure hook
+claude-auto-retry status             # Show recent monitor activity
+claude-auto-retry logs               # Follow today's log (Ctrl+C to stop)
+claude-auto-retry version            # Print version
+claude-auto-retry help               # Show help
 ```
+
+Only those bareword subcommands are intercepted; **any other invocation is forwarded to
+`claude` unchanged** (so `claude-auto-retry --version`, `claude-auto-retry mcp …`, etc.
+all reach Claude).
 
 ## For AI Agents
 
@@ -392,51 +365,39 @@ full setup is non-interactive:
 
 ```bash
 npm install -g claude-auto-retry
-claude-auto-retry install        # shell wrapper (+ tmux if missing)
 claude-auto-retry install-hook   # recommended: event-driven, scrape-free overload detection
 ```
 
 Notes for agents:
 
-- The wrapper takes effect in **new** shells — have the user `source` their shell rc or
-  open a new terminal. Sessions launched via the wrapper run inside tmux (required by
-  the monitor).
+- There is **no shell wrapper and no `install` step**. The user simply runs
+  `claude-auto-retry` in place of `claude`. Suggest aliasing `claude` to
+  `claude-auto-retry` in their shell profile if they want the old muscle memory.
 - Verify with `claude-auto-retry status` (monitor activity) and `claude-auto-retry logs`.
 - Configuration is optional and defaults are safe. To change it, write
   `~/.claude-auto-retry.json` (see [Configuration](#configuration)); invalid values fall
   back to defaults instead of crashing.
 - If the user runs multiple `CLAUDE_CONFIG_DIR`s, repeat `claude-auto-retry install-hook <path>` per dir.
-- Clean removal: `claude-auto-retry uninstall` and `claude-auto-retry uninstall-hook`.
+- Clean removal: `claude-auto-retry uninstall-hook` and `npm uninstall -g claude-auto-retry`.
 
 ## Platform Support
 
-### Operating Systems
-
-| OS | tmux auto-install | Status |
-|----|-------------------|--------|
-| Ubuntu / Debian | `apt-get` | Fully supported |
-| CentOS / RHEL / Fedora | `dnf` | Fully supported |
-| Rocky Linux / Amazon Linux | `dnf` | Fully supported |
-| macOS | `brew` | Fully supported |
-| Arch Linux | `pacman` | Fully supported |
-| Alpine | `apk` | Fully supported |
+| OS | Status | PTY backend |
+|----|--------|-------------|
+| Windows 10/11 | Fully supported | ConPTY |
+| macOS | Fully supported | forkpty |
+| Linux | Fully supported | forkpty |
 
 ### Requirements
 
 - **Node.js** >= 18
-- **tmux** >= 2.1 (auto-installed if missing)
-
-### Shell Support
-
-| Shell | Status |
-|-------|--------|
-| bash | Full (auto-install to `~/.bashrc`) |
-| zsh | Full (auto-install to `~/.zshrc`) |
-| fish | Manual setup (instructions printed on `install`) |
+- **Claude Code** installed and on your `PATH` (or set `CLAUDE_AUTO_RETRY_CLAUDE_BIN`)
+- No tmux, no shell configuration, no native compiler — the PTY backend
+  (`@lydell/node-pty`) ships prebuilt binaries for every supported platform.
 
 ## `--print` Mode
 
-For scripted/piped usage (`claude -p "..." | jq`), the tool:
+For scripted/piped usage (`claude-auto-retry -p "..." | jq`), the tool:
 
 1. Buffers all output (nothing goes to stdout until done)
 2. If rate-limited: discards partial output, waits, re-executes with same args
@@ -444,7 +405,7 @@ For scripted/piped usage (`claude -p "..." | jq`), the tool:
 
 ```bash
 # This just works — retries transparently if rate-limited
-claude -p "Generate a JSON schema" | jq .
+claude-auto-retry -p "Generate a JSON schema" | jq .
 ```
 
 ## Logging
@@ -452,7 +413,7 @@ claude -p "Generate a JSON schema" | jq .
 Logs are written to `~/.claude-auto-retry/logs/YYYY-MM-DD.log`:
 
 ```
-[2026-03-18 15:00:05] [INFO] Monitor started for pane %3 (claude PID: 12345)
+[2026-03-18 15:00:05] [INFO] Monitor started (session car-12345-ab12cd34)
 [2026-03-18 15:32:10] [INFO] Rate limit detected: "5-hour limit reached - resets 3pm". Waiting 3547s...
 [2026-03-18 16:01:10] [INFO] Sent retry message (attempt 1)
 ```
@@ -462,19 +423,28 @@ Logs rotate daily. Files older than 7 days are cleaned automatically.
 ## Uninstall
 
 ```bash
-claude-auto-retry uninstall
+claude-auto-retry uninstall-hook   # if you installed the StopFailure hook
 npm uninstall -g claude-auto-retry
 ```
 
-This removes the shell function from your rc files. tmux is left installed.
-
 ## Known Limitations
 
-1. **Retry message context** — The retry message is sent as plain text. If Claude was mid-confirmation or in a special input state, it may not interpret it as a continuation. You can customize the message via config.
+1. **No disconnect survival** — the session lives in the launcher process, so closing the
+   terminal or sleeping the machine ends it. Run inside tmux/screen yourself if you need
+   this on macOS/Linux. (This is the deliberate trade for dropping the tmux dependency.)
 
-2. **Node version lock** — The launcher path is resolved at install time. If you switch Node versions with nvm, re-run `claude-auto-retry install`.
+2. **Retry message context** — The retry message is sent as plain text. If Claude was
+   mid-confirmation or in a special input state, it may not interpret it as a
+   continuation. You can customize the message via config.
 
-3. **tmux required** — The tool needs tmux to monitor terminal output and inject keystrokes. It auto-installs if missing, but requires sudo for system package managers.
+3. **Claude must be on PATH** — resolved once at launch. Set `CLAUDE_AUTO_RETRY_CLAUDE_BIN`
+   to override, or if you switch Node/Claude installs.
+
+4. **Mouse on Windows requires the input pump** — claude's own mouse features (wheel
+   scrolling, drag-selection inside its UI) work only when the launcher's native input
+   pump starts (it normally does; check the log for "Native input pump active"). In
+   the fallback regime the wheel scrolls via a PgUp/PgDn translation and your
+   terminal's native selection works instead (see [Configuration](#configuration)).
 
 ## Contributing
 
@@ -485,25 +455,27 @@ Contributions are welcome! Here's how to get started:
 ```bash
 git clone https://github.com/cheapestinference/claude-auto-retry.git
 cd claude-auto-retry
-npm test            # Run all 128 tests
-npm link            # Install locally for testing
+npm install         # installs the PTY + terminal-emulator deps
+npm test            # run the test suite
+npm link            # install locally for testing
 ```
 
 ### Project Structure
 
 ```
 claude-auto-retry/
-├── bin/cli.js              # CLI: install/uninstall/status/logs/version
+├── bin/cli.js              # CLI: launch + install-hook/uninstall-hook/status/logs/version
 ├── src/
-│   ├── patterns.js         # Rate limit + overload detection + ANSI stripping
+│   ├── patterns.js         # Rate limit + overload + safeguard detection + ANSI stripping
 │   ├── time-parser.js      # Reset time parsing with timezone support
 │   ├── config.js           # Config loading + validation
 │   ├── logger.js           # File-based logging with rotation
-│   ├── tmux.js             # tmux command wrappers (execFile-based)
-│   ├── monitor.js          # Core monitoring loop + retry logic (usage + overload paths)
-│   ├── launcher.js         # Process orchestration + signal forwarding
-│   └── wrapper.sh          # Shell function template
-├── test/                   # 128 tests across 8 test files
+│   ├── pty.js              # PTY session (node-pty) + headless screen capture (xterm)
+│   ├── events.js           # StopFailure hook event channel (session-keyed markers)
+│   ├── pane-key.js         # Filename-safe session-key sanitizer
+│   ├── monitor.js          # Core monitoring loop + retry logic (usage + overload + safeguard)
+│   └── launcher.js         # PTY orchestration, stdio wiring, monitor wiring
+├── test/                   # Unit + integration tests
 ├── package.json
 ├── LICENSE
 └── README.md
@@ -511,11 +483,19 @@ claude-auto-retry/
 
 ### Architecture Decisions
 
-- **Zero dependencies** — only Node.js built-ins. Reduces supply chain risk and install size.
-- **`execFile` over `exec`** — all child process calls use array-based args to prevent shell injection.
-- **`stdio: 'inherit'`** — Claude gets the real TTY for full TUI support. The monitor reads pane content independently via `tmux capture-pane`.
-- **Iterative DST correction** — timezone offset is computed via 3-iteration convergence loop, not a single-shot formula that breaks at DST boundaries.
-- **Config validation** — invalid user config values fall back to safe defaults instead of producing NaN/undefined behavior.
+- **PTY over tmux** — hosting Claude in an in-process pseudo-terminal works on Windows and
+  needs no external program; a headless terminal emulator (`@xterm/headless`) turns the raw
+  PTY stream into a clean rendered screen, so detection scrapes an interpreted grid (like
+  `tmux capture-pane`) rather than a redraw-laden byte stream.
+- **Adapter-driven monitor** — `processOneTick` is written against a small terminal adapter
+  interface, so the state machine is platform-independent and unit-testable with a fake
+  adapter (and was ported from tmux to PTY without changing its logic).
+- **Prebuilt PTY binaries** — `@lydell/node-pty` ships prebuilt binaries for all platforms,
+  so `npm i` needs no compiler on Windows.
+- **Iterative DST correction** — timezone offset is computed via a 3-iteration convergence
+  loop, not a single-shot formula that breaks at DST boundaries.
+- **Config validation** — invalid user config values fall back to safe defaults instead of
+  producing NaN/undefined behavior.
 
 ### Running Tests
 
@@ -525,21 +505,11 @@ node --test test/patterns.test.js     # Single file
 node --test --watch test/             # Watch mode
 ```
 
-### Submitting Changes
-
-1. Fork the repo
-2. Create a feature branch (`git checkout -b feat/my-feature`)
-3. Write tests first (TDD)
-4. Make your changes
-5. Ensure all tests pass (`npm test`)
-6. Submit a Pull Request
-
 ### Areas for Contribution
 
 - **New rate limit patterns** — If you see a Claude Code rate limit message that isn't detected, open an issue with the exact text.
-- **Fish shell support** — Auto-install for fish shell (currently manual).
-- **Windows support** — WSL works, but native Windows would need a different approach.
 - **Notification integration** — Desktop/Slack notification when rate limit detected or when Claude resumes.
+- **Optional disconnect survival** — a supervised/daemon mode that outlives the launching terminal.
 
 ## Related Projects
 
@@ -551,20 +521,23 @@ node --test --watch test/             # Watch mode
 **Q: Does this work with Claude Max/Pro/Team?**
 A: Yes. It works with any Anthropic subscription that has usage-based rate limits.
 
-**Q: Does it work outside of tmux?**
-A: Yes. If you're not in tmux, it creates a tmux session transparently. You won't notice a difference.
+**Q: Do I still need tmux?**
+A: No. tmux is gone entirely; the tool hosts Claude in its own PTY on every platform, Windows included.
+
+**Q: Does it survive me closing the terminal / the laptop sleeping?**
+A: No — that was tmux's job and this port drops it deliberately. If you need it on macOS/Linux, launch `claude-auto-retry` inside your own tmux/screen session.
 
 **Q: What if I continue manually before the retry fires?**
 A: The monitor checks if the rate limit is still visible before sending keys. If you already continued, it resets and keeps watching.
 
 **Q: What if Claude exits while the monitor is waiting?**
-A: The monitor checks the Claude process every 30 seconds during the wait. If Claude exits, the monitor shuts down cleanly.
+A: The PTY closes, the monitor stops, and `claude-auto-retry` exits with Claude's exit code.
 
 **Q: Does it consume a lot of resources?**
-A: No. `tmux capture-pane` is extremely lightweight. The monitor uses ~0% CPU at a 5-second polling interval.
+A: No. Reading the emulated screen is extremely lightweight. The monitor uses ~0% CPU at a 5-second polling interval.
 
 **Q: Can it accidentally type into the wrong program?**
-A: The monitor verifies the foreground process is `node` or `claude` before sending keys. If you've switched to vim, bash, or anything else, it skips the retry.
+A: The PTY only ever hosts Claude, and the monitor injects only while Claude is alive and idle. There's no separate pane that could be showing another app.
 
 ## License
 

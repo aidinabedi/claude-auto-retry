@@ -1,65 +1,69 @@
-import { describe, it, afterEach } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile, readFile, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { injectWrapper, removeWrapper, MARKER_START, MARKER_END } from '../bin/cli.js';
+import { parseInvocation, MANAGEMENT_COMMANDS, stopFailureHookEntry } from '../bin/cli.js';
 
-describe('injectWrapper', () => {
-  const testFile = join(tmpdir(), `car-rc-test-${Date.now()}`);
-  afterEach(async () => { try { await unlink(testFile); } catch {} });
+describe('parseInvocation', () => {
+  it('routes reserved barewords to management commands', () => {
+    for (const cmd of ['install-hook', 'uninstall-hook', 'status', 'logs', 'version', 'help']) {
+      const { command, args } = parseInvocation([cmd]);
+      assert.equal(command, cmd);
+      assert.deepEqual(args, []);
+    }
+  });
 
-  it('adds wrapper to empty file', async () => {
-    await writeFile(testFile, '');
-    await injectWrapper(testFile, '/path/to/launcher.js');
-    const content = await readFile(testFile, 'utf-8');
-    assert.ok(content.includes(MARKER_START));
-    assert.ok(content.includes(MARKER_END));
-    assert.ok(content.includes('/path/to/launcher.js'));
+  it('passes the trailing args to a management command', () => {
+    const { command, args } = parseInvocation(['install-hook', '/custom/config']);
+    assert.equal(command, 'install-hook');
+    assert.deepEqual(args, ['/custom/config']);
   });
-  it('unaliases claude before defining the wrapper function (#10)', async () => {
-    await writeFile(testFile, '');
-    await injectWrapper(testFile, '/path/to/launcher.js');
-    const content = await readFile(testFile, 'utf-8');
-    const unaliasIdx = content.indexOf('unalias claude');
-    const fnIdx = content.indexOf('\nclaude() {');
-    assert.ok(unaliasIdx !== -1, 'wrapper should unalias claude');
-    assert.ok(unaliasIdx < fnIdx, 'unalias must come before the function definition');
+
+  it('forwards a bare launch (no args) to claude', () => {
+    const { command, args } = parseInvocation([]);
+    assert.equal(command, null);
+    assert.deepEqual(args, []);
   });
-  it('adds wrapper to file with existing content', async () => {
-    await writeFile(testFile, 'export PATH=$HOME/bin:$PATH\n');
-    await injectWrapper(testFile, '/path/to/launcher.js');
-    const content = await readFile(testFile, 'utf-8');
-    assert.ok(content.includes('export PATH'));
-    assert.ok(content.includes(MARKER_START));
+
+  it('forwards claude flags verbatim (not intercepted as our commands)', () => {
+    for (const argv of [['-p', 'hello'], ['--print'], ['--version'], ['--help'], ['--model', 'opus']]) {
+      const { command, args } = parseInvocation(argv);
+      assert.equal(command, null, `should forward ${argv.join(' ')}`);
+      assert.deepEqual(args, argv);
+    }
   });
-  it('replaces existing wrapper', async () => {
-    await writeFile(testFile, `before\n${MARKER_START}\nold stuff\n${MARKER_END}\nafter\n`);
-    await injectWrapper(testFile, '/new/path/launcher.js');
-    const content = await readFile(testFile, 'utf-8');
-    assert.ok(content.includes('/new/path'));
-    assert.ok(!content.includes('old stuff'));
-    assert.ok(content.includes('before'));
-    assert.ok(content.includes('after'));
+
+  it('forwards unknown claude subcommands verbatim (e.g. config, mcp)', () => {
+    const { command, args } = parseInvocation(['config', 'set', 'x', 'y']);
+    assert.equal(command, null);
+    assert.deepEqual(args, ['config', 'set', 'x', 'y']);
+  });
+
+  it('only intercepts the reserved word in the FIRST position', () => {
+    // "status" as an argument to claude, not our status command.
+    const { command, args } = parseInvocation(['-p', 'status']);
+    assert.equal(command, null);
+    assert.deepEqual(args, ['-p', 'status']);
   });
 });
 
-describe('removeWrapper', () => {
-  const testFile = join(tmpdir(), `car-rm-test-${Date.now()}`);
-  afterEach(async () => { try { await unlink(testFile); } catch {} });
-
-  it('removes wrapper and preserves surrounding content', async () => {
-    await writeFile(testFile, `before\n${MARKER_START}\nwrapper stuff\n${MARKER_END}\nafter\n`);
-    await removeWrapper(testFile);
-    const content = await readFile(testFile, 'utf-8');
-    assert.ok(!content.includes(MARKER_START));
-    assert.ok(content.includes('before'));
-    assert.ok(content.includes('after'));
+describe('MANAGEMENT_COMMANDS', () => {
+  it('is the exact reserved set (no install/uninstall — those were tmux-era)', () => {
+    assert.deepEqual(
+      [...MANAGEMENT_COMMANDS].sort(),
+      ['_stopfailure-hook', 'help', 'install-hook', 'logs', 'status', 'uninstall-hook', 'version'].sort(),
+    );
   });
-  it('does nothing when no wrapper present', async () => {
-    await writeFile(testFile, 'just normal content\n');
-    await removeWrapper(testFile);
-    const content = await readFile(testFile, 'utf-8');
-    assert.equal(content, 'just normal content\n');
+});
+
+describe('stopFailureHookEntry', () => {
+  it('matches only the transient-overload classes, never rate_limit', () => {
+    const entry = stopFailureHookEntry();
+    assert.equal(entry.matcher, 'overloaded|server_error');
+    assert.ok(!entry.matcher.includes('rate_limit'));
+  });
+  it('runs our hook handler via node with a quoted path', () => {
+    const entry = stopFailureHookEntry();
+    const cmd = entry.hooks[0].command;
+    assert.match(cmd, /^node ".+" _stopfailure-hook$/);
+    assert.equal(entry.hooks[0].type, 'command');
   });
 });

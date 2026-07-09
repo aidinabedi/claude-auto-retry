@@ -31,23 +31,23 @@ describe('StopFailure event markers', () => {
   before(async () => { dir = await mkdtemp(join(tmpdir(), 'car-ev-')); });
   after(async () => { await rm(dir, { recursive: true, force: true }); });
 
-  it('round-trips a pane-keyed marker', async () => {
-    await writeStopFailureEvent('%2', { error: 'overloaded', session_id: 'abc' }, dir);
-    const ev = await readStopFailureEvent('%2', 60_000, dir);
+  it('round-trips a session-keyed marker', async () => {
+    await writeStopFailureEvent('car-1-ab12', { error: 'overloaded', session_id: 'abc' }, dir);
+    const ev = await readStopFailureEvent('car-1-ab12', 60_000, dir);
     assert.equal(ev.error, 'overloaded');
-    assert.equal(ev.pane, '%2');
+    assert.equal(ev.session, 'car-1-ab12');
     assert.equal(ev.session_id, 'abc');
     assert.equal(typeof ev.ts, 'number');
   });
 
-  it('sanitizes the pane id into the filename', async () => {
-    await writeStopFailureEvent('%7', { error: 'server_error' }, dir);
+  it('sanitizes the session key into the filename', async () => {
+    await writeStopFailureEvent('sess/7:x', { error: 'server_error' }, dir);
     const files = await readdir(dir);
-    assert.ok(files.includes('_7.json'), files.join(','));
+    assert.ok(files.includes('sess_7_x.json'), files.join(','));
   });
 
   it('returns null for an absent marker', async () => {
-    assert.equal(await readStopFailureEvent('%99', 60_000, dir), null);
+    assert.equal(await readStopFailureEvent('nope-99', 60_000, dir), null);
   });
 
   it('treats a marker past maxAge as stale', async () => {

@@ -1,11 +1,10 @@
 {
   "name": "claude-auto-retry",
-  "version": "0.5.1",
-  "description": "Automatically retry Claude Code sessions on subscription rate limits and sustained API overload (529/500/503) with exponential backoff",
+  "version": "0.6.0",
+  "description": "Run `claude-auto-retry` to auto-retry Claude Code on subscription rate limits and sustained API overload (529/500/503). Cross-platform (Windows/macOS/Linux) via an in-process PTY — no tmux.",
   "type": "module",
   "bin": {
-    "claude-auto-retry": "./bin/cli.js",
-    "claude-auto-retry-tmux-status": "./bin/tmux-status.sh"
+    "claude-auto-retry": "./bin/cli.js"
   },
   "scripts": {
     "test": "node --test test/*.test.js"
@@ -14,10 +13,30 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "keywords": ["claude", "claude-code", "rate-limit", "retry", "tmux", "anthropic"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "rate-limit",
+    "retry",
+    "windows",
+    "pty",
+    "node-pty",
+    "anthropic"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/cheapestinference/claude-auto-retry"
   },
-  "files": ["bin/", "src/", "LICENSE", "README.md", "CHANGELOG.md", "llms.txt"]
+  "files": [
+    "bin/",
+    "src/",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "llms.txt"
+  ],
+  "dependencies": {
+    "@lydell/node-pty": "^1.2.0-beta.12",
+    "@xterm/headless": "^6.0.0"
+  }
 }

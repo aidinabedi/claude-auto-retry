@@ -31,15 +31,15 @@ export const DEFAULT_OVERLOAD = {
   steadyStateSeconds: 300,
   jitterPct: 15,
   maxTotalWaitMinutes: 120,
-  // StopFailure event markers older than this are ignored (guards against a recycled
-  // tmux pane id replaying a stale failure, or acting on a marker left while down).
+  // StopFailure event markers older than this are ignored (guards against acting on a
+  // stale marker left by a previous run, or one written while the monitor was down).
   eventMaxAgeSeconds: 120,
   retryMessage: 'Continue where you left off.',
   // Gating: by default we only act when claude is alive at its prompt (the
-  // foreground safety check passes). If a 500 ever drops you to the shell, the
-  // send-keys is correctly blocked and nothing resumes; flip relaunchOnExit to
-  // re-enter via relaunchCommand. Off by default — never type into a shell the
-  // user may be using. See README "Gating decision".
+  // foreground safety check passes). If a 500 ever causes claude to exit, injection is
+  // correctly blocked and nothing resumes; flip relaunchOnExit to re-enter via
+  // relaunchCommand. Off by default — never type into a shell the user may be using.
+  // See README "Gating decision".
   relaunchOnExit: false,
   relaunchCommand: 'claude --continue',
 };

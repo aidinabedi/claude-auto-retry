@@ -1,177 +1,45 @@
 #!/usr/bin/env node
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, watchFile, unwatchFile } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { execFileSync, spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { writeStopFailureEvent, isRetryableError } from '../src/events.js';
-import { sweepStaleStatus } from '../src/status-file.js';
+import { launch } from '../src/launcher.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const SRC_DIR = join(__dirname, '..', 'src');
-const LAUNCHER_PATH = join(SRC_DIR, 'launcher.js');
-const WRAPPER_TEMPLATE = join(SRC_DIR, 'wrapper.sh');
 
-export const MARKER_START = '# >>> claude-auto-retry >>>';
-export const MARKER_END = '# <<< claude-auto-retry <<<';
+// Internal subcommand Claude Code invokes as the StopFailure hook (see cmdInstallHook).
+const HOOK_MARKER = '_stopfailure-hook';
 
-// --- Wrapper injection ---
+// Bareword subcommands claude-auto-retry owns. Everything else — including all flags
+// like `-p`, `--model`, `--version` — is forwarded verbatim to `claude`, so the tool is
+// a drop-in `claude` replacement. Only these exact first-argument barewords are
+// intercepted (hyphenated hook names and uncommon words, to minimize collisions).
+export const MANAGEMENT_COMMANDS = new Set([
+  'install-hook', 'uninstall-hook', 'status', 'logs', 'version', 'help', HOOK_MARKER,
+]);
 
-export async function injectWrapper(rcFile, launcherPath) {
-  let content = '';
-  try {
-    content = await readFile(rcFile, 'utf-8');
-  } catch {
-    // File doesn't exist, create it
+// Split argv into a management command (or null → launch claude) plus its args.
+export function parseInvocation(argv) {
+  const first = argv[0];
+  if (first !== undefined && MANAGEMENT_COMMANDS.has(first)) {
+    return { command: first, args: argv.slice(1) };
   }
-
-  const template = await readFile(WRAPPER_TEMPLATE, 'utf-8');
-  const wrapper = template.replace(/__LAUNCHER_PATH__/g, launcherPath);
-
-  // Remove existing wrapper if present
-  const startIdx = content.indexOf(MARKER_START);
-  const endIdx = content.indexOf(MARKER_END);
-  if (startIdx !== -1 && endIdx !== -1) {
-    const afterMarker = endIdx + MARKER_END.length;
-    // Skip the newline after MARKER_END if present, but don't blindly +1
-    const skipTo = content[afterMarker] === '\n' ? afterMarker + 1
-                 : content.slice(afterMarker, afterMarker + 2) === '\r\n' ? afterMarker + 2
-                 : afterMarker;
-    content = content.slice(0, startIdx) + content.slice(skipTo);
-  }
-
-  content = content.trimEnd() + '\n\n' + wrapper + '\n';
-  await writeFile(rcFile, content);
+  return { command: null, args: argv };
 }
 
-export async function removeWrapper(rcFile) {
-  let content;
-  try {
-    content = await readFile(rcFile, 'utf-8');
-  } catch {
-    return;
-  }
-
-  const startIdx = content.indexOf(MARKER_START);
-  const endIdx = content.indexOf(MARKER_END);
-  if (startIdx === -1 || endIdx === -1) return;
-
-  const before = content.slice(0, startIdx).trimEnd();
-  const after = content.slice(endIdx + MARKER_END.length).trimStart();
-  content = before + (after ? '\n' + after : '\n');
-  await writeFile(rcFile, content);
+const LOG_DIR = join(homedir(), '.claude-auto-retry', 'logs');
+function todayLogFile() {
+  return join(LOG_DIR, `${new Date().toISOString().split('T')[0]}.log`);
 }
 
-// --- tmux install ---
-
-function detectOS() {
-  if (process.platform === 'darwin') return 'macos';
-  try {
-    const release = execFileSync('cat', ['/etc/os-release'], { encoding: 'utf-8' });
-    if (release.includes('ID=ubuntu') || release.includes('ID=debian') || release.includes('ID_LIKE=debian')) return 'debian';
-    if (release.includes('ID=fedora') || release.includes('ID=rhel') || release.includes('ID=centos')
-        || release.includes('ID=rocky') || release.includes('ID="amzn"')
-        || release.includes('ID_LIKE="rhel') || release.includes('ID_LIKE=rhel')) return 'rhel';
-    if (release.includes('ID=arch') || release.includes('ID_LIKE=arch')) return 'arch';
-    if (release.includes('ID=alpine')) return 'alpine';
-  } catch {}
-  return 'unknown';
-}
-
-function installTmux() {
-  const os = detectOS();
-  const cmds = {
-    debian: ['sudo', ['apt-get', 'install', '-y', 'tmux']],
-    rhel: ['sudo', ['dnf', 'install', '-y', 'tmux']],
-    arch: ['sudo', ['pacman', '-S', '--noconfirm', 'tmux']],
-    alpine: ['sudo', ['apk', 'add', 'tmux']],
-    macos: ['brew', ['install', 'tmux']],
-  };
-
-  const entry = cmds[os];
-  if (!entry) {
-    console.error('Could not detect OS. Please install tmux manually.');
-    process.exit(1);
-  }
-
-  console.log(`Installing tmux...`);
-  try {
-    execFileSync(entry[0], entry[1], { stdio: 'inherit' });
-  } catch {
-    console.error('Failed to install tmux. Please install it manually.');
-    process.exit(1);
-  }
-}
-
-function checkTmux() {
-  try {
-    const version = execFileSync('tmux', ['-V'], { encoding: 'utf-8' }).trim();
-    const match = version.match(/tmux\s+(\d+\.\d+)/);
-    if (match && parseFloat(match[1]) >= 2.1) return true;
-    console.error(`tmux version ${match?.[1] || 'unknown'} is too old. Requires >= 2.1.`);
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-// --- CLI commands ---
-
-async function cmdInstall() {
-  console.log('claude-auto-retry: installing...\n');
-
-  if (!checkTmux()) {
-    console.log('tmux not found or too old. Attempting install...');
-    installTmux();
-    if (!checkTmux()) { console.error('tmux install failed.'); process.exit(1); }
-  }
-  console.log('tmux OK');
-
-  const shell = process.env.SHELL || '/bin/bash';
-  if (shell.includes('fish')) {
-    console.error('\nFish shell detected. Automatic install not supported.');
-    console.error(`Add manually to ~/.config/fish/config.fish:`);
-    console.error(`  function claude; set -x CLAUDE_AUTO_RETRY_ACTIVE 1; node "${LAUNCHER_PATH}" $argv; set -e CLAUDE_AUTO_RETRY_ACTIVE; end`);
-    process.exit(1);
-  }
-
-  const rcFiles = [];
-  const bashrc = join(homedir(), '.bashrc');
-  const zshrc = join(homedir(), '.zshrc');
-
-  if (existsSync(bashrc) || shell.includes('bash')) rcFiles.push(bashrc);
-  if (existsSync(zshrc) || shell.includes('zsh')) rcFiles.push(zshrc);
-  if (rcFiles.length === 0) rcFiles.push(bashrc);
-
-  for (const rc of rcFiles) {
-    await injectWrapper(rc, LAUNCHER_PATH);
-    console.log(`Shell function added to ${rc}`);
-  }
-
-  console.log(`\nInstalled! Launcher path: ${LAUNCHER_PATH}`);
-  console.log('\nRestart your shell or run:');
-  for (const rc of rcFiles) { console.log(`  source ${rc}`); }
-  console.log('\nNote: If you switch Node versions (nvm), re-run: claude-auto-retry install');
-}
-
-async function cmdUninstall() {
-  const bashrc = join(homedir(), '.bashrc');
-  const zshrc = join(homedir(), '.zshrc');
-  for (const rc of [bashrc, zshrc]) { await removeWrapper(rc); }
-  // Best-effort GC of tmux-status snapshot files left behind by monitors that died
-  // without cleaning up (SIGKILL, host sleep/crash) — see src/status-file.js. Failure
-  // here must never block the uninstall itself.
-  await sweepStaleStatus().catch(() => {});
-  console.log('Shell function removed. Restart your shell to complete.');
-}
+// --- status / logs ---
 
 async function cmdStatus() {
-  const logDir = join(homedir(), '.claude-auto-retry', 'logs');
-  const today = new Date().toISOString().split('T')[0];
-  const logFile = join(logDir, `${today}.log`);
+  const logFile = todayLogFile();
   try {
     const content = await readFile(logFile, 'utf-8');
     const lines = content.trim().split('\n');
@@ -179,64 +47,66 @@ async function cmdStatus() {
     console.log('Last 10 entries:');
     console.log(lines.slice(-10).join('\n'));
   } catch {
-    console.log('No activity today. Log directory:', logDir);
+    console.log('No activity today. Log directory:', LOG_DIR);
   }
 }
 
+// Node-based `tail -f` (portable — no `tail` on Windows). Prints the current contents,
+// then follows appends until Ctrl+C. watchFile polls, which is reliable across platforms.
 async function cmdLogs() {
-  const logDir = join(homedir(), '.claude-auto-retry', 'logs');
-  const today = new Date().toISOString().split('T')[0];
-  const logFile = join(logDir, `${today}.log`);
-  if (!existsSync(logFile)) {
-    console.log(`No log file for today: ${logFile}`);
-    return;
-  }
-  const tail = spawn('tail', ['-f', logFile], { stdio: 'inherit' });
-  tail.on('error', (err) => {
-    console.error(`Failed to tail log: ${err.message}`);
-  });
-  await new Promise((resolve) => {
-    tail.on('exit', resolve);
-    tail.on('error', resolve);
-  });
+  const logFile = todayLogFile();
+  let printed = 0;
+  const flush = async () => {
+    try {
+      const content = await readFile(logFile, 'utf-8');
+      if (content.length > printed) {
+        process.stdout.write(content.slice(printed));
+        printed = content.length;
+      }
+    } catch { /* not created yet — keep waiting */ }
+  };
+  if (!existsSync(logFile)) console.log(`Waiting for today's log: ${logFile}`);
+  await flush();
+  watchFile(logFile, { interval: 1000 }, flush);
+  process.on('SIGINT', () => { unwatchFile(logFile); process.exit(0); });
+  await new Promise(() => {}); // run until Ctrl+C
 }
 
 // --- StopFailure hook (event-driven overload trigger) ---
-
-const HOOK_MARKER = '_stopfailure-hook';
-
-function stopFailureHookEntry() {
-  // Matcher filters on the StopFailure error type; only the transient-overload classes.
-  // rate_limit is intentionally omitted — a session/usage limit is an hours-scale wait
-  // owned by the scraper usage path, not a seconds-scale event retry (see src/events.js).
-  return {
-    matcher: 'overloaded|server_error',
-    hooks: [{ type: 'command', command: `node ${__filename} ${HOOK_MARKER}`, timeout: 5 }],
-  };
-}
 
 function resolveConfigDir(arg) {
   return arg || process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
 }
 
+export function stopFailureHookEntry() {
+  // Matcher filters on the StopFailure error type; only the transient-overload classes.
+  // rate_limit is intentionally omitted — a session/usage limit is an hours-scale wait
+  // owned by the scraper usage path, not a seconds-scale event retry (see src/events.js).
+  // The path is quoted so a Windows install path containing spaces still parses.
+  return {
+    matcher: 'overloaded|server_error',
+    hooks: [{ type: 'command', command: `node "${__filename}" ${HOOK_MARKER}`, timeout: 5 }],
+  };
+}
+
 // Invoked BY Claude Code on a turn-ending API error. Reads the hook JSON on stdin and,
-// for a retryable error, writes a pane-keyed marker the monitor consumes. Must never
+// for a retryable error, writes a session-keyed marker the monitor consumes. Must never
 // disrupt the session: StopFailure output/exit is ignored, and we swallow all errors.
 async function cmdStopFailureHook() {
   try {
     const chunks = [];
     for await (const c of process.stdin) chunks.push(c);
     const payload = JSON.parse(Buffer.concat(chunks).toString() || '{}');
-    const pane = process.env.CLAUDE_AUTO_RETRY_PANE;
-    if (pane && isRetryableError(payload.error)) {
-      await writeStopFailureEvent(pane, payload);
+    const session = process.env.CLAUDE_AUTO_RETRY_SESSION;
+    if (session && isRetryableError(payload.error)) {
+      await writeStopFailureEvent(session, payload);
     }
   } catch { /* swallow — never break the host session */ }
   process.exit(0);
 }
 
-async function cmdInstallHook() {
-  const settingsPath = join(resolveConfigDir(process.argv[3]), 'settings.json');
+async function cmdInstallHook(dirArg) {
+  const settingsPath = join(resolveConfigDir(dirArg), 'settings.json');
   let settings = {};
   try { settings = JSON.parse(await readFile(settingsPath, 'utf-8')); } catch { /* new file */ }
   if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
@@ -248,11 +118,11 @@ async function cmdInstallHook() {
   await mkdir(dirname(settingsPath), { recursive: true });
   await writeFile(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   console.log(`StopFailure hook installed in ${settingsPath}`);
-  console.log('New Claude sessions launched via the wrapper will use event-driven detection.');
+  console.log('New sessions launched via claude-auto-retry will use event-driven detection.');
 }
 
-async function cmdUninstallHook() {
-  const settingsPath = join(resolveConfigDir(process.argv[3]), 'settings.json');
+async function cmdUninstallHook(dirArg) {
+  const settingsPath = join(resolveConfigDir(dirArg), 'settings.json');
   try {
     const settings = JSON.parse(await readFile(settingsPath, 'utf-8'));
     if (Array.isArray(settings.hooks?.StopFailure)) {
@@ -274,29 +144,45 @@ async function cmdVersion() {
   }
 }
 
-// --- Main ---
-const command = process.argv[2];
-
-switch (command) {
-  case 'install': await cmdInstall(); break;
-  case 'uninstall': await cmdUninstall(); break;
-  case 'install-hook': await cmdInstallHook(); break;
-  case 'uninstall-hook': await cmdUninstallHook(); break;
-  case HOOK_MARKER: await cmdStopFailureHook(); break;
-  case 'status': await cmdStatus(); break;
-  case 'logs': await cmdLogs(); break;
-  case 'version': case '--version': case '-v': await cmdVersion(); break;
-  default:
-    console.log('claude-auto-retry - Auto-retry Claude Code on subscription rate limits\n');
-    console.log('Usage:');
-    console.log('  claude-auto-retry install            Install shell wrapper + tmux');
-    console.log('  claude-auto-retry uninstall          Remove shell wrapper');
-    console.log('  claude-auto-retry install-hook [dir] Install the StopFailure hook (event-driven');
-    console.log('                                       overload detection) into <dir>/settings.json');
-    console.log('                                       (default: $CLAUDE_CONFIG_DIR or ~/.claude)');
-    console.log('  claude-auto-retry uninstall-hook [dir]  Remove the StopFailure hook');
-    console.log('  claude-auto-retry status             Show monitor status');
-    console.log('  claude-auto-retry logs               Tail today\'s log');
-    console.log('  claude-auto-retry version            Print version');
-    break;
+function cmdHelp() {
+  console.log('claude-auto-retry - Auto-retry Claude Code on subscription rate limits & API overload\n');
+  console.log('Usage:');
+  console.log('  claude-auto-retry [claude args...]   Launch Claude Code with the auto-retry monitor');
+  console.log('                                       (drop-in replacement for `claude`)');
+  console.log('  claude-auto-retry -p "..."           Print/piped mode with transparent retry\n');
+  console.log('Management commands:');
+  console.log('  claude-auto-retry install-hook [dir] Install the StopFailure hook (event-driven');
+  console.log('                                       overload detection) into <dir>/settings.json');
+  console.log('                                       (default: $CLAUDE_CONFIG_DIR or ~/.claude)');
+  console.log('  claude-auto-retry uninstall-hook [dir]  Remove the StopFailure hook');
+  console.log('  claude-auto-retry status             Show recent monitor activity');
+  console.log('  claude-auto-retry logs               Follow today\'s log (Ctrl+C to stop)');
+  console.log('  claude-auto-retry version            Print version');
+  console.log('  claude-auto-retry help               Show this help\n');
+  console.log('Any other invocation is forwarded to `claude` unchanged.');
 }
+
+// --- Main ---
+async function main() {
+  const { command, args } = parseInvocation(process.argv.slice(2));
+
+  switch (command) {
+    case 'install-hook': await cmdInstallHook(args[0]); break;
+    case 'uninstall-hook': await cmdUninstallHook(args[0]); break;
+    case HOOK_MARKER: await cmdStopFailureHook(); break;
+    case 'status': await cmdStatus(); break;
+    case 'logs': await cmdLogs(); break;
+    case 'version': await cmdVersion(); break;
+    case 'help': cmdHelp(); break;
+    default: {
+      // Not a management command → run claude with all args, forwarding its exit code.
+      const code = await launch(args);
+      process.exit(code);
+    }
+  }
+}
+
+// Run only when executed directly (`claude-auto-retry ...` or the hook), never when a
+// test imports this module for its exported helpers.
+const invokedDirectly = !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) main();
