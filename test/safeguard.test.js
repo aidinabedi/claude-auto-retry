@@ -18,6 +18,14 @@ function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = tru
   return t;
 }
 
+function mockLogger() {
+  return {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+  };
+}
+
 function cfg(overrides = {}) {
   return { ...DEFAULT_CONFIG, safeguard: { ...DEFAULT_SAFEGUARD, ...overrides } };
 }
@@ -102,7 +110,7 @@ describe('processOneTick — safeguard path', () => {
   it('enters the safeguard wait on detection (no send yet)', async () => {
     const t = mockTmux(FLAG);
     const s = createMonitorState();
-    const r = await processOneTick(s, t, '%0', cfg(), () => true);
+    const r = await processOneTick(s, t, '%0', cfg(), () => true, mockLogger());
     assert.equal(r, 'safeguard-detected');
     assert.equal(s.status, 'safeguard');
     assert.equal(t._sent.length, 0);
@@ -113,7 +121,7 @@ describe('processOneTick — safeguard path', () => {
     const t = mockTmux(FLAG);
     const s = createMonitorState();
     s.status = 'safeguard'; s.safeguardWaitUntil = Date.now() - 1;
-    const r = await processOneTick(s, t, '%0', cfg(), () => true);
+    const r = await processOneTick(s, t, '%0', cfg(), () => true, mockLogger());
     assert.equal(r, 'safeguard-retried');
     assert.equal(t._sent[0], 'continue');
     assert.equal(s.safeguardAttempts, 1);
@@ -124,14 +132,14 @@ describe('processOneTick — safeguard path', () => {
     const s = createMonitorState();
     const c = cfg({ maxRetries: 2, retryDelaySeconds: 1 });
     // detect
-    await processOneTick(s, t, '%0', c, () => true);
+    await processOneTick(s, t, '%0', c, () => true, mockLogger());
     // two retries
-    for (let i = 0; i < 2; i++) { s.safeguardWaitUntil = Date.now() - 1; await processOneTick(s, t, '%0', c, () => true); }
+    for (let i = 0; i < 2; i++) { s.safeguardWaitUntil = Date.now() - 1; await processOneTick(s, t, '%0', c, () => true, mockLogger()); }
     assert.equal(s.safeguardAttempts, 2);
     assert.equal(t._sent.length, 2);
     // third pass → give up, no further send
     s.safeguardWaitUntil = Date.now() - 1;
-    assert.equal(await processOneTick(s, t, '%0', c, () => true), 'safeguard-gave-up');
+    assert.equal(await processOneTick(s, t, '%0', c, () => true, mockLogger()), 'safeguard-gave-up');
     assert.equal(t._sent.length, 2);
     assert.equal(s._gaveUp, true, 'give-up must be flagged for external consumers (e.g. tmux status bar)');
   });
@@ -140,7 +148,7 @@ describe('processOneTick — safeguard path', () => {
     const t = mockTmux('All good — here is your answer.');
     const s = createMonitorState();
     s.status = 'safeguard'; s.safeguardWaitUntil = Date.now() - 1; s.safeguardAttempts = 1;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true), 'safeguard-cleared');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger()), 'safeguard-cleared');
     assert.equal(s.status, 'monitoring');
     assert.equal(s.safeguardAttempts, 0);
   });
@@ -153,7 +161,7 @@ describe('processOneTick — safeguard path', () => {
     const t = mockTmux(FLAG + '\n✻ Thinking… (esc to interrupt)');
     const s = createMonitorState();
     s.status = 'safeguard'; s.safeguardWaitUntil = Date.now() - 1; s.safeguardAttempts = 2;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true), 'safeguard-working');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger()), 'safeguard-working');
     assert.equal(s.safeguardAttempts, 2);   // NOT reset
     assert.equal(s.status, 'safeguard');    // still owns the flag
     assert.equal(t._sent.length, 0);
@@ -163,17 +171,17 @@ describe('processOneTick — safeguard path', () => {
     const c = cfg({ maxRetries: 2, retryDelaySeconds: 1 });
     const flagged = mockTmux(FLAG);
     const s = createMonitorState();
-    await processOneTick(s, flagged, '%0', c, () => true);            // detect
+    await processOneTick(s, flagged, '%0', c, () => true, mockLogger());            // detect
     let sent = 0;
     for (let i = 0; i < 10; i++) {
       // alternate: retry tick at idle-with-flag, then a mid-flight (working) tick
       s.safeguardWaitUntil = Date.now() - 1;
       const idle = mockTmux(FLAG);
-      const r1 = await processOneTick(s, idle, '%0', c, () => true);
+      const r1 = await processOneTick(s, idle, '%0', c, () => true, mockLogger());
       sent += idle._sent.length;
       s.safeguardWaitUntil = Date.now() - 1;
       const working = mockTmux(FLAG + '\n✻ Thinking… (esc to interrupt)');
-      await processOneTick(s, working, '%0', c, () => true);
+      await processOneTick(s, working, '%0', c, () => true, mockLogger());
       sent += working._sent.length;
       if (r1 === 'safeguard-gave-up' || r1 === 'safeguard-holding') break;
     }
@@ -186,9 +194,9 @@ describe('processOneTick — safeguard path', () => {
     const t = mockTmux(FLAG);
     const s = createMonitorState();
     s.status = 'safeguard'; s.safeguardWaitUntil = Date.now() - 1; s.safeguardAttempts = 1;
-    assert.equal(await processOneTick(s, t, '%0', c, () => true), 'safeguard-gave-up');
+    assert.equal(await processOneTick(s, t, '%0', c, () => true, mockLogger()), 'safeguard-gave-up');
     s.safeguardWaitUntil = Date.now() - 1;
-    assert.equal(await processOneTick(s, t, '%0', c, () => true), 'safeguard-holding');
+    assert.equal(await processOneTick(s, t, '%0', c, () => true, mockLogger()), 'safeguard-holding');
     assert.equal(t._sent.length, 0);
   });
 
@@ -202,7 +210,7 @@ describe('processOneTick — safeguard path', () => {
     ].join('\n');
     const t = mockTmux(pane);
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger()), 'monitoring');
     assert.equal(t._sent.length, 0);
   });
 
@@ -210,27 +218,27 @@ describe('processOneTick — safeguard path', () => {
     const t = mockTmux(FLAG, 'vim', false);
     const s = createMonitorState();
     s.status = 'safeguard'; s.safeguardWaitUntil = Date.now() - 1;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true), 'skipped-not-claude');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger()), 'skipped-not-claude');
     assert.equal(t._sent.length, 0);
   });
 
   it('usage-limit takes precedence over a co-present safeguard flag', async () => {
     const t = mockTmux(FLAG + '\nYou\'ve hit your session limit · resets 3pm (UTC)');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true), 'waiting');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger()), 'waiting');
     assert.equal(s.status, 'waiting');
   });
 
   it('does not enter safeguard while Claude is working', async () => {
     const t = mockTmux(FLAG + '\n· Cooking… (esc to interrupt)');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger()), 'monitoring');
   });
 
   it('disabled safeguard block is ignored', async () => {
     const t = mockTmux(FLAG);
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg({ enabled: false }), () => true), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', cfg({ enabled: false }), () => true, mockLogger()), 'monitoring');
     assert.equal(t._sent.length, 0);
   });
 });

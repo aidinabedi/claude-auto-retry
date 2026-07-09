@@ -22,6 +22,14 @@ function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = tru
   return t;
 }
 
+function mockLogger() {
+  return {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+  };
+}
+
 // Deterministic config: zero jitter so scheduled waits are exact.
 function cfg(overrides = {}) {
   return { ...DEFAULT_CONFIG, overload: { ...DEFAULT_OVERLOAD, jitterPct: 0, ...overrides } };
@@ -174,7 +182,7 @@ describe('processOneTick — overload path', () => {
   it('enters overload (not usage-wait) on a 529', async () => {
     const t = mockTmux('API Error: 529 Overloaded');
     const s = createMonitorState();
-    const r = await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER);
+    const r = await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER);
     assert.equal(r, 'overload-detected');
     assert.equal(s.status, 'overload');
     assert.ok(near(s.overloadWaitUntil - Date.now(), 30_000));
@@ -184,14 +192,14 @@ describe('processOneTick — overload path', () => {
   it('does NOT enter overload while Claude is working', async () => {
     const t = mockTmux('API Error: 529 Overloaded\n· Cogitating… (esc to interrupt)');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'monitoring');
     assert.equal(s.status, 'monitoring');
   });
 
   it('does NOT enter overload while Claude is still internally retrying (colon form + suffix)', async () => {
     const t = mockTmux('API Error: 529 {"type":"error"} · Retrying in 5s · attempt 3/10');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'monitoring');
     assert.equal(s.status, 'monitoring');
     assert.equal(t._sent.length, 0);
   });
@@ -199,14 +207,14 @@ describe('processOneTick — overload path', () => {
   it('does NOT retry a non-target error', async () => {
     const t = mockTmux('Here is the answer to your question. Done.');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'monitoring');
     assert.equal(t._sent.length, 0);
   });
 
   it('usage-limit takes precedence over a co-present overload pattern', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)\nAPI Error: 529 Overloaded');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'waiting');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'waiting');
     assert.equal(s.status, 'waiting');
   });
 
@@ -214,7 +222,7 @@ describe('processOneTick — overload path', () => {
     const t = mockTmux('API Error: 529 Overloaded');
     const s = createMonitorState();
     s.status = 'overload'; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
-    const r = await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER);
+    const r = await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER);
     assert.equal(r, 'overload-retried');
     assert.equal(t._sent.length, 1);
     assert.equal(t._sent[0], DEFAULT_OVERLOAD.retryMessage);
@@ -226,11 +234,11 @@ describe('processOneTick — overload path', () => {
     const t = mockTmux('API Error: 529 Overloaded');
     const s = createMonitorState();
     // tick 1: detect → first 30s window
-    await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER);
+    await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER);
     const seen = [Math.round((s.overloadWaitUntil - Date.now()) / 1000)];
     for (let i = 0; i < 5; i++) {
       s.overloadWaitUntil = Date.now() - 1;                       // force expiry
-      await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER);
+      await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER);
       seen.push(Math.round((s.overloadWaitUntil - Date.now()) / 1000));
     }
     assert.deepEqual(seen, [30, 60, 120, 240, 300, 300]);
@@ -241,7 +249,7 @@ describe('processOneTick — overload path', () => {
     const t = mockTmux('API Error: 529 Overloaded\nThinking… (esc to interrupt)');
     const s = createMonitorState();
     s.status = 'overload'; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-working');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'overload-working');
     assert.equal(t._sent.length, 0);
     assert.equal(s.overloadAttempts, 0); // no attempt consumed
   });
@@ -250,7 +258,7 @@ describe('processOneTick — overload path', () => {
     const t = mockTmux('All good, here is your refactor.');
     const s = createMonitorState();
     s.status = 'overload'; s.overloadWaitUntil = Date.now() - 1; s.overloadAttempts = 2; s.overloadTotalWaitMs = 90_000;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-cleared');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'overload-cleared');
     assert.equal(s.status, 'monitoring');
     assert.equal(s.overloadAttempts, 0);
   });
@@ -259,11 +267,11 @@ describe('processOneTick — overload path', () => {
     const t = mockTmux('API Error: 529 Overloaded');
     const c = cfg({ backoffSeconds: [30, 60], maxTotalWaitMinutes: 0.75 }); // cap = 45s
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', c, () => true, NO_JITTER), 'overload-detected'); // +30s (total 30)
+    assert.equal(await processOneTick(s, t, '%0', c, () => true, mockLogger(), NO_JITTER), 'overload-detected'); // +30s (total 30)
     s.overloadWaitUntil = Date.now() - 1;
-    assert.equal(await processOneTick(s, t, '%0', c, () => true, NO_JITTER), 'overload-retried');   // +60s (total 90 > cap)
+    assert.equal(await processOneTick(s, t, '%0', c, () => true, mockLogger(), NO_JITTER), 'overload-retried');   // +60s (total 90 > cap)
     s.overloadWaitUntil = Date.now() - 1;
-    assert.equal(await processOneTick(s, t, '%0', c, () => true, NO_JITTER), 'overload-gave-up');
+    assert.equal(await processOneTick(s, t, '%0', c, () => true, mockLogger(), NO_JITTER), 'overload-gave-up');
     assert.equal(t._sent.length, 1);
     assert.equal(s._gaveUp, true, 'give-up must be flagged for external consumers (e.g. tmux status bar)');
   });
@@ -272,7 +280,7 @@ describe('processOneTick — overload path', () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)');
     const s = createMonitorState();
     s.status = 'overload'; s.overloadWaitUntil = Date.now() - 1; s.overloadAttempts = 1; s.overloadTotalWaitMs = 60_000;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'waiting');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'waiting');
     assert.equal(s.status, 'waiting');
     assert.equal(s.overloadAttempts, 0);
   });
@@ -284,7 +292,7 @@ describe('processOneTick — StopFailure event path (authoritative)', () => {
   it('enters overload from a StopFailure marker with NO scraper match', async () => {
     const t = mockTmux('working on a /health endpoint res.status(503)', 'node', true, ev);
     const s = createMonitorState();
-    const r = await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER);
+    const r = await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER);
     assert.equal(r, 'overload-detected');
     assert.equal(s.eventMode, true);    // latched
     assert.equal(s.viaEvent, true);
@@ -297,7 +305,7 @@ describe('processOneTick — StopFailure event path (authoritative)', () => {
     const t = mockTmux('idle prompt', 'node', true, null);
     const s = createMonitorState();
     s.status = 'overload'; s.viaEvent = true; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
-    const r = await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER);
+    const r = await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER);
     assert.equal(r, 'overload-retried');
     assert.equal(t._sent[0], DEFAULT_OVERLOAD.retryMessage);
     assert.equal(s.status, 'monitoring');   // back to waiting for the next failure
@@ -309,7 +317,7 @@ describe('processOneTick — StopFailure event path (authoritative)', () => {
     const t = mockTmux('Thinking… (esc to interrupt)', 'node', true, null);
     const s = createMonitorState();
     s.status = 'overload'; s.viaEvent = true; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-cleared');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'overload-cleared');
     assert.equal(t._sent.length, 0);
     assert.equal(s.status, 'monitoring');
   });
@@ -317,7 +325,7 @@ describe('processOneTick — StopFailure event path (authoritative)', () => {
   it('treats an event as self-recovered if Claude is already working at detection', async () => {
     const t = mockTmux('Cogitating… (esc to interrupt)', 'node', true, ev);
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-cleared');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'overload-cleared');
     assert.equal(t._cleared, true);
     assert.equal(s.status, 'monitoring');
     assert.equal(t._sent.length, 0);
@@ -331,7 +339,7 @@ describe('processOneTick — StopFailure event path (authoritative)', () => {
     for (const bad of ['rate_limit', 'billing_error', 'invalid_request']) {
       const t = mockTmux('idle prompt', 'node', true, { error: bad, ts: Date.now() });
       const s = createMonitorState();
-      const r = await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER);
+      const r = await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER);
       assert.equal(r, 'event-ignored', bad);
       assert.equal(s.eventMode, false, bad);   // NOT latched
       assert.equal(s.status, 'monitoring', bad);
@@ -344,7 +352,7 @@ describe('processOneTick — StopFailure event path (authoritative)', () => {
     const t = mockTmux('API Error: 529 Overloaded', 'node', true, null);  // scraper WOULD match
     const s = createMonitorState();
     s.eventMode = true;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'monitoring');
     assert.equal(t._sent.length, 0);
   });
 
@@ -352,7 +360,7 @@ describe('processOneTick — StopFailure event path (authoritative)', () => {
     const t = mockTmux('user@host:~$', 'bash', false, null);
     const s = createMonitorState();
     s.status = 'overload'; s.viaEvent = true; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-exited-to-shell');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'overload-exited-to-shell');
     assert.equal(t._sent.length, 0);
     assert.equal(s.status, 'monitoring');
   });
@@ -365,7 +373,7 @@ describe('processOneTick — StopFailure event path (authoritative)', () => {
     const s = createMonitorState();
     const c = cfg({ maxTotalWaitMinutes: 0.5 }); // cap = 30s
     s.overloadTotalWaitMs = 30_000; // already at/over the cap before this tick
-    const r = await processOneTick(s, t, '%0', c, () => true, NO_JITTER);
+    const r = await processOneTick(s, t, '%0', c, () => true, mockLogger(), NO_JITTER);
     assert.equal(r, 'overload-gave-up');
     assert.equal(s.status, 'monitoring');
     assert.equal(s._gaveUp, true);
@@ -377,7 +385,7 @@ describe('processOneTick — overload gating (exited-to-shell vs alive)', () => 
     const t = mockTmux('API Error: 500 Internal server error\nuser@host:~$', 'bash', false);
     const s = createMonitorState();
     s.status = 'overload'; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-exited-to-shell');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'overload-exited-to-shell');
     assert.equal(t._sent.length, 0);
     assert.equal(s._lastForeground, 'bash');
   });
@@ -387,7 +395,7 @@ describe('processOneTick — overload gating (exited-to-shell vs alive)', () => 
     const s = createMonitorState();
     s.status = 'overload'; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
     const c = cfg({ relaunchOnExit: true });
-    assert.equal(await processOneTick(s, t, '%0', c, () => true, NO_JITTER), 'overload-relaunched');
+    assert.equal(await processOneTick(s, t, '%0', c, () => true, mockLogger(), NO_JITTER), 'overload-relaunched');
     assert.equal(t._sent.length, 1);
     assert.equal(t._sent[0], 'claude --continue');
     assert.equal(s.overloadAttempts, 1);
@@ -397,7 +405,7 @@ describe('processOneTick — overload gating (exited-to-shell vs alive)', () => 
     const t = mockTmux('API Error: 503', 'vim', false);
     const s = createMonitorState();
     s.status = 'overload'; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'skipped-not-claude');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'skipped-not-claude');
     assert.equal(t._sent.length, 0);
   });
 
@@ -405,14 +413,14 @@ describe('processOneTick — overload gating (exited-to-shell vs alive)', () => 
     const t = mockTmux('API Error: 500 Internal server error', 'node', true);
     const s = createMonitorState();
     s.status = 'overload'; s.overloadWaitUntil = Date.now() - 1; s.overloadTotalWaitMs = 30_000;
-    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, NO_JITTER), 'overload-retried');
+    assert.equal(await processOneTick(s, t, '%0', cfg(), () => true, mockLogger(), NO_JITTER), 'overload-retried');
     assert.equal(t._sent.length, 1);
   });
 
   it('disabled overload block is ignored entirely', async () => {
     const t = mockTmux('API Error: 529 Overloaded');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', cfg({ enabled: false }), () => true, NO_JITTER), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', cfg({ enabled: false }), () => true, mockLogger(), NO_JITTER), 'monitoring');
     assert.equal(t._sent.length, 0);
   });
 });

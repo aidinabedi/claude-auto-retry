@@ -16,6 +16,14 @@ function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = tru
   return t;
 }
 
+function mockLogger() {
+  return {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+  };
+}
+
 const MENU_UPGRADE_FIRST = [
   "You've hit your session limit · resets 6:50pm (Europe/London)",
   'What do you want to do?',
@@ -36,20 +44,20 @@ describe('processOneTick', () => {
   it('returns monitoring when no rate limit', async () => {
     const t = mockTmux('Normal output');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'monitoring');
     assert.equal(t._sent.length, 0);
   });
   it('enters waiting on rate limit', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'waiting');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'waiting');
     assert.ok(s.waitUntil > Date.now());
   });
 
   it('navigates the menu down to "Stop and wait" when "Upgrade" is the default (#19)', async () => {
     const t = mockTmux(MENU_UPGRADE_FIRST);
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'menu-confirmed');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'menu-confirmed');
     // One Down to move off "Upgrade", then Enter to confirm "Stop and wait".
     assert.deepEqual(t._keys, ['Down', 'Enter']);
     assert.equal(t._sent.length, 0);            // never typed a stray message
@@ -60,7 +68,7 @@ describe('processOneTick', () => {
   it('confirms directly when "Stop and wait" is already highlighted (#19)', async () => {
     const t = mockTmux(MENU_WAIT_FIRST);
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'menu-confirmed');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'menu-confirmed');
     assert.deepEqual(t._keys, ['Enter']);       // no navigation needed
     assert.equal(s.status, 'waiting');
   });
@@ -69,7 +77,7 @@ describe('processOneTick', () => {
     // Menu is up, but some other app (vim) is focused and the process isn't fg.
     const t = mockTmux(MENU_UPGRADE_FIRST, 'vim', false);
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'skipped-not-claude');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'skipped-not-claude');
     assert.equal(t._keys.length, 0);   // pressed no menu keys
     assert.notEqual(s.status, 'waiting');
   });
@@ -80,7 +88,7 @@ describe('processOneTick', () => {
     const pane = [...MENU_UPGRADE_FIRST.split('\n'), ...Array(12).fill('● unrelated work below the quoted menu'), '❯ '].join('\n');
     const t = mockTmux(pane);
     const s = createMonitorState();
-    const r = await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true);
+    const r = await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger());
     assert.notEqual(r, 'menu-confirmed');
     assert.equal(t._keys.length, 0);   // no arrow/Enter keys driven
   });
@@ -90,7 +98,7 @@ describe('processOneTick', () => {
     const noCursor = ['What do you want to do?', '  1. Upgrade your plan', '  2. Stop and wait for limit to reset', 'Enter to confirm'].join('\n');
     const t = mockTmux(noCursor);
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'menu-unreadable');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'menu-unreadable');
     assert.equal(t._keys.length, 0);            // pressed nothing
     assert.equal(t._sent.length, 0);
   });
@@ -98,13 +106,13 @@ describe('processOneTick', () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)');
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting';
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => false), 'exit');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => false, mockLogger()), 'exit');
   });
   it('sends retry when wait expired and rate limit visible', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)');
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting';
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'retried');
     assert.equal(t._sent.length, 1);
     assert.equal(s.attempts, 1);
     // Should stay in 'waiting' with a cooldown to let Claude process
@@ -114,7 +122,7 @@ describe('processOneTick', () => {
   it('detects multi-line TUI rate limit', async () => {
     const t = mockTmux('⚠ You\'ve hit your limit\n· resets 3pm (UTC)');
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'waiting');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'waiting');
     assert.ok(s.waitUntil > Date.now());
   });
 
@@ -126,7 +134,7 @@ describe('processOneTick', () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)\n· Doing… (esc to interrupt)');
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting'; s.attempts = 1;
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'user-continued');
     assert.equal(t._sent.length, 0);          // never injects into the working session
     assert.equal(s.status, 'monitoring');
     assert.equal(s.attempts, 0);
@@ -139,7 +147,7 @@ describe('processOneTick', () => {
     const pane = ['You hit your session limit · resets 3pm (UTC)', ...Array(15).fill('● working on unrelated code'), '❯ '].join('\n');
     const t = mockTmux(pane);
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'monitoring');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'monitoring');
     assert.equal(s.status, 'monitoring');
     assert.equal(t._sent.length, 0);
   });
@@ -147,20 +155,20 @@ describe('processOneTick', () => {
     const pane = ['earlier output', 'more output', "You've hit your session limit · resets 3pm (UTC)"].join('\n');
     const t = mockTmux(pane);
     const s = createMonitorState();
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'waiting');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'waiting');
   });
   it('retries when Claude process is in foreground (fixes macOS zsh issue)', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)', 'zsh', true);
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting';
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'retried');
     assert.equal(t._sent.length, 1);
   });
   it('falls back to pane_current_command when process state is false', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)', 'vim', false);
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting';
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'skipped-not-claude');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'skipped-not-claude');
     assert.equal(t._sent.length, 0);
     assert.equal(s._lastForeground, 'vim');
   });
@@ -168,7 +176,7 @@ describe('processOneTick', () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)', 'vim', null);
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting';
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'skipped-not-claude');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'skipped-not-claude');
     assert.equal(t._sent.length, 0);
     assert.equal(s._lastForeground, 'vim');
   });
@@ -177,27 +185,27 @@ describe('processOneTick', () => {
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting';
     const config = { ...DEFAULT_CONFIG, foregroundCommands: ['my-claude-wrapper'] };
-    assert.equal(await processOneTick(s, t, '%0', config, () => true), 'retried');
+    assert.equal(await processOneTick(s, t, '%0', config, () => true, mockLogger()), 'retried');
     assert.equal(t._sent.length, 1);
   });
   it('matches npx in fallback path', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)', 'npx', null);
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting';
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'retried');
   });
   it('resets counter when rate limit disappears', async () => {
     const t = mockTmux('Claude is working normally');
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting'; s.attempts = 2;
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'user-continued');
     assert.equal(s.attempts, 0);
   });
   it('stops retrying after max attempts and stays in waiting', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)');
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting'; s.attempts = 5;
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'max-retries');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'max-retries');
     // Should stay in 'waiting' to avoid re-detection loop
     assert.equal(s.status, 'waiting');
     assert.ok(s.waitUntil > Date.now());
@@ -210,7 +218,7 @@ describe('processOneTick', () => {
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting'; s.attempts = 10; s._gaveUp = true;
     // Rate limit cleared → should detect user-continued before max-retries check
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'user-continued');
     assert.equal(s.attempts, 0);
     assert.equal(s._gaveUp, false);
   });

@@ -96,10 +96,10 @@ function enterOverload(state, overload, rand) {
   return 'overload-detected';
 }
 
-export async function processOneTick(state, adapter, pane, config, isAlive, rand = Math.random) {
+export async function processOneTick(state, adapter, pane, config, isAlive, logger, rand = Math.random) {
   if (!isAlive()) return 'exit';
 
-  const raw = await adapter.capturePane(pane, 20);
+  const raw = await adapter.capturePane(pane);
   const stripped = stripAnsi(raw);
   const overload = config.overload;
 
@@ -431,7 +431,7 @@ export function startMonitor(adapter, isAlive, { config, logger }) {
   const loop = async () => {
     if (stopped) return;
     try {
-      const result = await processOneTick(state, adapter, pane, config, isAlive);
+      const result = await processOneTick(state, adapter, pane, config, isAlive, logger);
       consecutiveErrors = 0;
 
       if (result === 'exit') {
