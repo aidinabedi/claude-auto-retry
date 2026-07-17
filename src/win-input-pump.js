@@ -127,8 +127,11 @@ public static class Pump {
     if (char.IsHighSurrogate(c)) { hiSur = c; return ""; }
     if (char.IsLowSurrogate(c) && hiSur != '\0') { s = new string(new char[]{ hiSur, c }); hiSur = '\0'; }
     else { s = c.ToString(); }
-    // Ctrl+letter already arrives as the control byte in the char; Alt adds ESC.
-    return alt ? ESC + s : s;
+    // Ctrl+letter already arrives as the control byte in the char. ESC-prefix only
+    // for PURE Alt: Windows delivers AltGr as Ctrl+Alt with the layout-translated
+    // char in UnicodeChar (e.g. Swedish AltGr+2 = '@'), and prefixing that with ESC
+    // mangles third-level characters on European layouts — emit the char verbatim.
+    return (alt && !ctrl) ? ESC + s : s;
   }
   static string Mouse(REC r) {
     int x = r.MX + 1, y = r.MY + 1;

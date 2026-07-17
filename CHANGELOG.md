@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `claude-auto-retry clear-logs` — delete all monitor log files.
 
 ### Fixed
+- AltGr characters (Windows input pump): third-level layout characters — `@ £ { [ ] } \ |`
+  on a Swedish keyboard and equivalents on other European layouts — arrived at claude
+  with a spurious ESC prefix, because Windows delivers AltGr as Ctrl+Alt and the pump
+  treated any Alt as "prefix with ESC". The pump now ESC-prefixes only pure Alt
+  (Alt without Ctrl) and emits AltGr's layout-translated character verbatim, matching
+  libuv/conhost behavior. Verified by injecting win32-encoded AltGr key records for
+  the full Swedish set through a real ConPTY.
 - False `user-continued` at wait expiry (field report): a single banner-free screen
   capture — a repaint, an overlay, a scrolled transcript — was read as "the user
   already continued", silently stopping the monitor from ever sending its retry. The
