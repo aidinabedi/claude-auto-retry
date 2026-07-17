@@ -20,9 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - False `user-continued` at wait expiry (field report): a single banner-free screen
   capture — a repaint, an overlay, a scrolled transcript — was read as "the user
   already continued", silently stopping the monitor from ever sending its retry. The
-  verdict now requires the evidence on two consecutive ticks, and the
+  verdict now requires the evidence on two consecutive ticks, the
   `/rate-limit-options` menu being on screen is treated as "still limited" rather than
-  as a resume. The log message now says what was actually observed.
+  as a resume, and — the decisive check for the persistent case — a session that
+  produced **no output for the entire wait** is treated as stuck (retry sent) rather
+  than resumed, since "resumed and finished" and "never resumed, banner out of view"
+  render identically but only a resumed session (or claude's own reset countdown,
+  which self-resumes) emits output. The log message now says what was actually
+  observed.
 - A parsed reset time recently in the past (≤60 min — a stale banner re-read at wait
   expiry) no longer re-arms a wait for tomorrow's occurrence of that clock time
   (~23h idle); the limit has already lifted, so the monitor retries after the

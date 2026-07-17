@@ -191,10 +191,12 @@ export function createPtySession({ file, args = [], cwd, env, cols = 80, rows = 
 
   let alive = true;
   let exitInfo = null;
+  let lastDataAt = Date.now();
   const dataHandlers = [];
   const exitHandlers = [];
 
   child.onData((data) => {
+    lastDataAt = Date.now();
     term.write(data);
     for (const h of dataHandlers) {
       try { h(data); } catch { /* a bad subscriber must not kill the stream */ }
@@ -215,6 +217,10 @@ export function createPtySession({ file, args = [], cwd, env, cols = 80, rows = 
     get pid() { return child.pid; },
     get exitInfo() { return exitInfo; },
     isAlive: () => alive,
+    // Timestamp of the last byte claude emitted. The monitor uses this to tell a
+    // resumed-then-finished session (produced output during the wait) from a stuck,
+    // never-resumed one (byte-for-byte silent) when the limit banner is out of view.
+    lastOutputAt: () => lastDataAt,
     onData: (cb) => { dataHandlers.push(cb); },
     onExit: (cb) => { if (!alive && exitInfo) cb(exitInfo); else exitHandlers.push(cb); },
     write: (data) => { try { child.write(data); } catch { /* pty gone */ } },

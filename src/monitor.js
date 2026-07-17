@@ -76,6 +76,7 @@ function enterUsageWait(state, stripped, config) {
   state.waitUntil = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
   state.status = 'waiting';
   state._gaveUp = false;
+  state._waitEnteredAt = Date.now();   // anchor for the resumed-vs-stuck output check
   return 'waiting';
 }
 
@@ -155,6 +156,7 @@ export async function processOneTick(state, adapter, pane, config, isAlive, logg
     const parsed = message ? parseResetTime(message) : null;
     state.waitUntil = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
     state.status = 'waiting';
+    state._waitEnteredAt = Date.now();
     state._menuCooldownUntil = Date.now() + cooldown;
     return 'menu-confirmed';
   }
@@ -172,24 +174,42 @@ export async function processOneTick(state, adapter, pane, config, isAlive, logg
     if (!isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES) || isWorking(stripped)) {
       // The /rate-limit-options menu on screen means the session is still limited —
       // the menu merely covers the banner in the tail. Not a resume; the menu handler
-      // above will drive it once its cooldown clears.
+      // above will drive it once its cooldown clears. (Narrow window only: in the
+      // normal flow the handler consumes the menu long before the wait expires.)
       if (isRateLimitOptionsPrompt(stripped, RATE_LIMIT_TAIL_LINES)) {
         state._continuedPending = false;
         state.waitUntil = Date.now() + config.pollIntervalSeconds * 1000;
         return 'waiting';
       }
-      // Debounce: one banner-free capture is weak evidence — repaints, overlays and
-      // transcript scrolling all transiently hide the banner, and a false
-      // 'user-continued' silently stops the monitor from ever sending the retry
-      // (observed in the field). Require the evidence on two consecutive ticks.
-      if (!state._continuedPending) {
-        state._continuedPending = true;
-        state.waitUntil = Date.now() + config.pollIntervalSeconds * 1000;
-        return 'waiting';
+      // An idle prompt with the banner out of view is ambiguous: "resumed and
+      // finished" and "never resumed, banner scrolled/covered" render identically.
+      // Claude's OUTPUT during the wait disambiguates: a resume — or claude's own
+      // reset countdown, which self-resumes — produces output, while a stuck session
+      // is byte-for-byte silent. If the adapter can tell and the session has been
+      // silent since the wait began (slack skips the render of entering the wait),
+      // treat it as NOT resumed and fall through to the retry path below. Our own
+      // injection echoes count as output, so this fires at most until the first
+      // retry gets a reaction — it cannot loop against a truly wedged session.
+      const OUTPUT_SLACK_MS = 10_000;
+      if (!isWorking(stripped) && typeof adapter.lastOutputAt === 'function' && state._waitEnteredAt
+          && adapter.lastOutputAt() <= state._waitEnteredAt + OUTPUT_SLACK_MS) {
+        state._continuedPending = false;
+        state._hiddenBannerRetry = true;
+        // fall through to the max-retries / foreground / send logic below
+      } else {
+        // Debounce: one banner-free capture is weak evidence — repaints, overlays and
+        // transcript scrolling all transiently hide the banner, and a false
+        // 'user-continued' silently stops the monitor from ever sending the retry
+        // (observed in the field). Require the evidence on two consecutive ticks.
+        if (!state._continuedPending) {
+          state._continuedPending = true;
+          state.waitUntil = Date.now() + config.pollIntervalSeconds * 1000;
+          return 'waiting';
+        }
+        state._continuedPending = false;
+        state.status = 'monitoring'; state.attempts = 0; state._gaveUp = false;
+        return 'user-continued';
       }
-      state._continuedPending = false;
-      state.status = 'monitoring'; state.attempts = 0; state._gaveUp = false;
-      return 'user-continued';
     }
     state._continuedPending = false;
 
@@ -502,7 +522,13 @@ export function startMonitor(adapter, isAlive, { config, logger }) {
         state.lastRateLimitMessage = null;
       }
       if (result === 'menu-unreadable') await logger.warn('Rate-limit options menu detected but its layout could not be read; not pressing Enter (would risk confirming "Upgrade your plan"). Will recheck.');
-      if (result === 'retried') await logger.info(`Sent retry message (attempt ${state.attempts})`);
+      if (result === 'retried') {
+        if (state._hiddenBannerRetry) {
+          state._hiddenBannerRetry = false;
+          await logger.warn('Limit banner not visible at wait expiry, but the session produced no output for the entire wait — treating as still limited (not resumed), not as "user continued".');
+        }
+        await logger.info(`Sent retry message (attempt ${state.attempts})`);
+      }
       if (result === 'user-continued') await logger.info('Session resumed without our retry (limit banner gone or Claude working on two consecutive checks). Attempt counter reset.');
       if (result === 'rescan-updated') {
         const secs = Math.round((state.waitUntil - Date.now()) / 1000);

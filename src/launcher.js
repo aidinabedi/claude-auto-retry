@@ -70,6 +70,7 @@ export function buildPtyAdapter(session, sessionKey, config) {
     // "switched to another app in the same pane" case to guard against as there was in tmux.
     getPaneCommand: async () => (session.isAlive() ? 'claude' : ''),
     isClaudeForeground: async () => session.isAlive(),
+    lastOutputAt: () => session.lastOutputAt(),
     sendKeys: async (_pane, text) => {
       session.write(text);
       await new Promise((r) => setTimeout(r, SUBMIT_DELAY_MS));

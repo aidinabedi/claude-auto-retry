@@ -163,6 +163,34 @@ describe('processOneTick', () => {
     assert.equal(t._sent.length, 1);
   });
 
+  // --- The persistent-hide case (the debounce alone can't catch it): banner out of
+  //     view for good, session never resumed. Output-silence during the wait is the
+  //     discriminator — a resumed session (or claude's own reset countdown) produces
+  //     output; a stuck one is silent. Silent + hidden banner ⇒ retry, not stand-down.
+  it('retries a silent session even when the banner is persistently hidden', async () => {
+    const t = mockTmux('❯ ');                        // idle prompt, banner nowhere in view
+    const enteredAt = Date.now() - 3600_000;         // wait began an hour ago
+    t.lastOutputAt = () => enteredAt + 2_000;        // ...and claude has been silent since
+    const s = createMonitorState();
+    s.status = 'waiting'; s.waitUntil = Date.now() - 1000; s._waitEnteredAt = enteredAt;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'retried');
+    assert.equal(t._sent.length, 1);                 // the session gets its retry
+    assert.equal(s._hiddenBannerRetry, true);        // flagged for the log line
+    assert.equal(s.status, 'waiting');
+  });
+
+  it('stands down (user-continued) when output flowed during the wait', async () => {
+    const t = mockTmux('❯ ');
+    const enteredAt = Date.now() - 3600_000;
+    t.lastOutputAt = () => Date.now() - 60_000;      // claude produced output mid-wait
+    const s = createMonitorState();
+    s.status = 'waiting'; s.waitUntil = Date.now() - 1000; s._waitEnteredAt = enteredAt;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'waiting'); // debounce
+    s.waitUntil = Date.now() - 1;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true, mockLogger()), 'user-continued');
+    assert.equal(t._sent.length, 0);
+  });
+
   it('does NOT declare user-continued while the rate-limit menu covers the banner', async () => {
     // Menu without the banner line, and the menu handler in cooldown — the exact
     // window where the old code misread "banner absent" as a resume.
